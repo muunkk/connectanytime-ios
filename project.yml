@@ -1,0 +1,85 @@
+name: ConnectAnytime
+options:
+  bundleIdPrefix: com.muunkk
+  deploymentTarget:
+    iOS: "18.4"
+configFiles:
+  Debug: Config/Base.xcconfig
+  Release: Config/Base.xcconfig
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    KEYCHAIN_GROUP: "$(AppIdentifierPrefix)com.muunkk.connectanytime.shared"
+targets:
+  ConnectAnytime:
+    type: application
+    platform: iOS
+    sources: [App, Shared]
+    dependencies:
+      - target: ConnectAnytimeTunnel
+      - target: ConnectAnytimeWidgets
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.muunkk.connectanytime
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_CFBundleDisplayName: ConnectAnytime
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: ConnectAnytime
+        KeychainGroup: "$(KEYCHAIN_GROUP)"
+        UILaunchScreen: {}
+        UISupportedInterfaceOrientations: [UIInterfaceOrientationPortrait]
+    entitlements:
+      path: App/ConnectAnytime.entitlements
+      properties:
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        com.apple.developer.networking.wifi-info: true
+        keychain-access-groups: ["$(KEYCHAIN_GROUP)"]
+  ConnectAnytimeTunnel:
+    type: app-extension
+    platform: iOS
+    sources: [Tunnel, Shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.muunkk.connectanytime.tunnel
+        SWIFT_OBJC_BRIDGING_HEADER: Tunnel/Tunnel-Bridging-Header.h
+        HEADER_SEARCH_PATHS: "$(SRCROOT)/Vendor/out/include"
+        LIBRARY_SEARCH_PATHS: "$(SRCROOT)/Vendor/out/lib"
+        OTHER_LDFLAGS: "-lopenconnect -lssl -lcrypto -lxml2 -lz -liconv"
+        ENABLE_BITCODE: NO
+    info:
+      path: Tunnel/Info.plist
+      properties:
+        CFBundleDisplayName: ConnectAnytime Tunnel
+        KeychainGroup: "$(KEYCHAIN_GROUP)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.networkextension.packet-tunnel
+          NSExtensionPrincipalClass: "$(PRODUCT_MODULE_NAME).PacketTunnelProvider"
+    entitlements:
+      path: Tunnel/ConnectAnytimeTunnel.entitlements
+      properties:
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        keychain-access-groups: ["$(KEYCHAIN_GROUP)"]
+  ConnectAnytimeWidgets:
+    type: app-extension
+    platform: iOS
+    sources: [Widgets, Shared]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.muunkk.connectanytime.widgets
+    info:
+      path: Widgets/Info.plist
+      properties:
+        CFBundleDisplayName: ConnectAnytime
+        KeychainGroup: "$(KEYCHAIN_GROUP)"
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    entitlements:
+      path: Widgets/ConnectAnytimeWidgets.entitlements
+      properties:
+        com.apple.developer.networking.networkextension: [packet-tunnel-provider]
+        keychain-access-groups: ["$(KEYCHAIN_GROUP)"]
