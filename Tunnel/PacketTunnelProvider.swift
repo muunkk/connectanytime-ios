@@ -11,6 +11,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var lastNetwork: String?
     private var watchdog: DispatchSourceTimer?
     private var reconnectDeadline: Date?
+    private var pendingReconnect: DispatchWorkItem?
 
     /// After an auto-connect fails (e.g. Duo ignored), don't let iOS's on-demand
     /// retries keep sending Duo pushes. Manual connects are never blocked.
@@ -87,11 +88,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.queue.async { self.watchNetwork() }
 
                 Thread {
-                    ocb_run(s, fd, Self.resumeWindow) // blocks until cancelled or the session ends
+                    let result = ocb_run(s, fd, Self.resumeWindow) // blocks until cancelled or the session ends
                     self.queue.async {
                         let byServer = !self.stopping
                         self.finishSession()
-                        if byServer { self.cancelTunnelWithError(self.failure("The VPN session ended.")) }
+                        guard byServer else { return }
+                        let message = switch result {
+                        case -EPERM: "Your VPN session expired. Connect again to log in."
+                        case -EINTR: "Couldn't reconnect in \(Self.resumeWindow / 60) minutes. Connect again to log in."
+                        default: "The VPN session ended."
+                        }
+                        self.cancelTunnelWithError(self.failure(message))
                     }
                 }.start()
             }
@@ -115,6 +122,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         watchdog?.cancel()
         watchdog = nil
         reconnectDeadline = nil
+        pendingReconnect?.cancel()
+        pendingReconnect = nil
         if let s = session { ocb_free(s) }
         session = nil
     }
@@ -126,17 +135,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard session != nil, pathMonitor == nil else { return }
         let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other, .loopback]) // skip our own tunnel
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let self, let s = self.session else { return }
+            guard let self, self.session != nil else { return }
             // The first interface is the one in use. Its name alone misses Wi-Fi → Wi-Fi
             // (both en0); the gateway differs.
             let network = path.status != .satisfied ? "offline"
-                : ([path.availableInterfaces.first?.name ?? ""] + path.gateways.map { "\($0)" }).joined(separator: ",")
+                : ([path.availableInterfaces.first?.name ?? ""] + path.gateways.map { "\($0)" }.sorted()).joined(separator: ",")
             defer { self.lastNetwork = network }
             guard let last = self.lastNetwork, last != network else { return }
             self.reconnecting()
             guard network != "offline" else { return }
-            self.log("Network changed; reconnecting with the existing session")
-            ocb_reconnect(s)
+            // Path updates come in bursts (interface, then gateways); reconnect once.
+            self.pendingReconnect?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, let s = self.session else { return }
+                self.log("Network changed; reconnecting with the existing session")
+                ocb_reconnect(s)
+            }
+            self.pendingReconnect = work
+            self.queue.asyncAfter(deadline: .now() + 1, execute: work)
         }
         pathMonitor = monitor
         monitor.start(queue: queue)
