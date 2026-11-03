@@ -7,7 +7,8 @@
 
 typedef struct ocb_session ocb_session;
 typedef void (*ocb_log_fn)(void *ctx, int level, const char *line);
-typedef void (*ocb_event_fn)(void *ctx);
+enum { OCB_RECONNECTING, OCB_RECONNECTED };
+typedef void (*ocb_event_fn)(void *ctx, int event);
 
 /// Tunnel settings pushed by the server. Strings are owned by the struct.
 typedef struct {
@@ -24,7 +25,7 @@ typedef struct {
 
 ocb_session *ocb_new(const char *server, const char *user, const char *password,
                      const char *second_password, ocb_log_fn log,
-                     ocb_event_fn reconnected, void *ctx);
+                     ocb_event_fn event, void *ctx);
 
 /// Logs in (username, password, then second password for Duo) and opens the
 /// VPN session. Blocks until Duo is approved or rejected. 0 on success.
@@ -35,7 +36,8 @@ void ocb_config_free(ocb_config *c);
 
 /// Runs the tunnel on `tun_fd` until cancelled or the server ends it. If the
 /// connection drops, keeps retrying with the existing session (no new login or
-/// Duo) for up to `reconnect_timeout` seconds. Calls `reconnected` on success.
+/// Duo) for up to `reconnect_timeout` seconds of sleeps between attempts. Reports
+/// OCB_RECONNECTING when it notices a dropped connection and OCB_RECONNECTED after.
 int ocb_run(ocb_session *s, int tun_fd, int reconnect_timeout);
 
 /// Thread-safe: drops the current connection and reconnects right away with

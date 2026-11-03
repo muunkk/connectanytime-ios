@@ -9,6 +9,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var stopping = false
     private var pathMonitor: NWPathMonitor?
     private var lastNetwork: String?
+    private var watchdog: DispatchSourceTimer?
+    private var reconnectDeadline: Date?
 
     /// After an auto-connect fails (e.g. Duo ignored), don't let iOS's on-demand
     /// retries keep sending Duo pushes. Manual connects are never blocked.
@@ -41,9 +43,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let s = ocb_new(server, user, password, AppConfig.duoSecondPassword, { ctx, _, line in
                 guard let ctx, let line else { return }
                 Unmanaged<PacketTunnelProvider>.fromOpaque(ctx).takeUnretainedValue().log(String(cString: line))
-            }, { ctx in
+            }, { ctx, event in
                 guard let ctx else { return }
-                Unmanaged<PacketTunnelProvider>.fromOpaque(ctx).takeUnretainedValue().reasserting = false
+                let provider = Unmanaged<PacketTunnelProvider>.fromOpaque(ctx).takeUnretainedValue()
+                provider.queue.async {
+                    if event == Int32(OCB_RECONNECTED) { provider.reconnected() } else { provider.reconnecting() }
+                }
             }, ctx) else {
                 return completionHandler(self.failure("Couldn't start the VPN client."))
             }
@@ -107,6 +112,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         pathMonitor?.cancel()
         pathMonitor = nil
         lastNetwork = nil
+        watchdog?.cancel()
+        watchdog = nil
+        reconnectDeadline = nil
         if let s = session { ocb_free(s) }
         session = nil
     }
@@ -125,13 +133,44 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 : ([path.availableInterfaces.first?.name ?? ""] + path.gateways.map { "\($0)" }).joined(separator: ",")
             defer { self.lastNetwork = network }
             guard let last = self.lastNetwork, last != network else { return }
-            guard network != "offline" else { return self.reasserting = true } // cleared once reconnected
+            self.reconnecting()
+            guard network != "offline" else { return }
             self.log("Network changed; reconnecting with the existing session")
-            self.reasserting = true
             ocb_reconnect(s)
         }
         pathMonitor = monitor
         monitor.start(queue: queue)
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 60, repeating: 60)
+        timer.setEventHandler { [weak self] in self?.checkReconnect() }
+        timer.resume()
+        watchdog = timer
+    }
+
+    private func reconnecting() {
+        reasserting = true
+        if reconnectDeadline == nil {
+            reconnectDeadline = Date().addingTimeInterval(TimeInterval(Self.resumeWindow))
+        }
+    }
+
+    private func reconnected() {
+        reasserting = false
+        reconnectDeadline = nil
+    }
+
+    /// OpenConnect's retry timeout only counts its sleeps, and a connect or TLS
+    /// handshake can hang with no timeout. While reconnecting, retry every minute
+    /// and give up by the clock, so a full tunnel can't blackhole traffic for long.
+    private func checkReconnect() {
+        guard let s = session, let deadline = reconnectDeadline else { return }
+        if Date() >= deadline {
+            log("Couldn't reconnect in \(Self.resumeWindow / 60) minutes; ending the session")
+            ocb_cancel(s)
+        } else {
+            ocb_reconnect(s)
+        }
     }
 
     private func failure(_ message: String) -> NSError {

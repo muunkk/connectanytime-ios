@@ -18,7 +18,7 @@ struct ocb_session {
     char *user, *password, *second;
     char *server;
     ocb_log_fn log;
-    ocb_event_fn reconnected;
+    ocb_event_fn event;
     void *ctx;
     bool answered_user, answered_password, answered_second;
     char auth_error[512];
@@ -40,6 +40,12 @@ static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
 // which include the submitted password.
 static void progress_cb(void *priv, int level, const char *fmt, ...) {
     struct ocb_session *s = priv;
+    // OpenConnect has no "reconnecting" callback. These messages mark a dropped
+    // connection it's retrying: a dead peer, or a failed attempt before its sleep.
+    // (Built without NLS, so the format strings are the English originals.)
+    if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
+                     !strncmp(fmt, "sleep %ds", 9)))
+        s->event(s->ctx, OCB_RECONNECTING);
     if (level > PRG_INFO || !s->log) return;
     char buf[1024];
     va_list ap;
@@ -139,12 +145,12 @@ static int validate_cert_cb(void *priv, const char *reason) {
 static void reconnected_cb(void *priv) {
     struct ocb_session *s = priv;
     logf_(s, PRG_INFO, "Reconnected with the existing session");
-    if (s->reconnected) s->reconnected(s->ctx);
+    if (s->event) s->event(s->ctx, OCB_RECONNECTED);
 }
 
 ocb_session *ocb_new(const char *server, const char *user, const char *password,
                      const char *second_password, ocb_log_fn log,
-                     ocb_event_fn reconnected, void *ctx) {
+                     ocb_event_fn event, void *ctx) {
     static bool ssl_ready = false;
     if (!ssl_ready) { openconnect_init_ssl(); ssl_ready = true; }
 
@@ -155,7 +161,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     s->password = strdup(password);
     s->second = strdup(second_password);
     s->log = log;
-    s->reconnected = reconnected;
+    s->event = event;
     s->ctx = ctx;
     s->vpn = openconnect_vpninfo_new(NULL, validate_cert_cb, NULL, auth_form_cb, progress_cb, s);
     if (!s->vpn) { ocb_free(s); return NULL; }
