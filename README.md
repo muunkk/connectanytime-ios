@@ -15,6 +15,11 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
 - **Auto-connect** when you join Wi-Fi networks you choose. If an automatic attempt fails
   (say you ignored Duo), it pauses for 15 minutes instead of sending more pushes.
   Disconnecting pauses auto-connect until you connect again.
+- **Survives network changes.** Switch Wi-Fi, drop to cellular or lose signal for a while,
+  and the VPN reconnects with the session it already has, like Cisco's client. No new
+  login, no new Duo push, as long as the server still holds the session. It usually
+  reconnects within seconds, and keeps trying for up to 30 minutes; meanwhile traffic
+  waits rather than bypassing the VPN.
 - **Full tunnel**, like NYU's Cisco setup. IPv6 is dropped rather than bypassing the VPN.
 
 ## How it works

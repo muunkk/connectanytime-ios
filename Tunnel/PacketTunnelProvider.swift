@@ -1,3 +1,4 @@
+import Network
 import NetworkExtension
 import os
 
@@ -6,11 +7,21 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let queue = DispatchQueue(label: "connectanytime.tunnel")
     private var session: OpaquePointer?
     private var stopping = false
+    private var pathMonitor: NWPathMonitor?
+    private var lastNetwork: String?
+    private var watchdog: DispatchSourceTimer?
+    private var reconnectDeadline: Date?
+    private var pendingReconnect: DispatchWorkItem?
 
     /// After an auto-connect fails (e.g. Duo ignored), don't let iOS's on-demand
     /// retries keep sending Duo pushes. Manual connects are never blocked.
     private static let autoRetryPause: TimeInterval = 15 * 60
     private static let lastAutoFailureKey = "lastAutoFailure"
+
+    /// How long to keep retrying a dropped connection with the existing session
+    /// (no Duo) before giving up, e.g. while walking between Wi-Fi networks.
+    /// The server may end the session sooner; then the next connect needs Duo.
+    private static let resumeWindow: Int32 = 30 * 60
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let manual = options?[AppConfig.manualStartKey] != nil
@@ -33,6 +44,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let s = ocb_new(server, user, password, AppConfig.duoSecondPassword, { ctx, _, line in
                 guard let ctx, let line else { return }
                 Unmanaged<PacketTunnelProvider>.fromOpaque(ctx).takeUnretainedValue().log(String(cString: line))
+            }, { ctx, event in
+                guard let ctx else { return }
+                let provider = Unmanaged<PacketTunnelProvider>.fromOpaque(ctx).takeUnretainedValue()
+                provider.queue.async {
+                    if event == Int32(OCB_RECONNECTED) { provider.reconnected() } else { provider.reconnecting() }
+                }
             }, ctx) else {
                 return completionHandler(self.failure("Couldn't start the VPN client."))
             }
@@ -68,13 +85,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.log("Connected")
                 completionHandler(nil)
                 VPNQuickControl.reloadControl()
+                self.queue.async { self.watchNetwork() }
 
                 Thread {
-                    ocb_run(s, fd) // blocks until cancelled or the server ends the session
+                    let result = ocb_run(s, fd, Self.resumeWindow) // blocks until cancelled or the session ends
                     self.queue.async {
                         let byServer = !self.stopping
                         self.finishSession()
-                        if byServer { self.cancelTunnelWithError(self.failure("The VPN session ended.")) }
+                        guard byServer else { return }
+                        let message = switch result {
+                        case -EPERM: "Your VPN session expired. Connect again to log in."
+                        case -EINTR: "Couldn't reconnect in \(Self.resumeWindow / 60) minutes. Connect again to log in."
+                        default: "The VPN session ended."
+                        }
+                        self.cancelTunnelWithError(self.failure(message))
                     }
                 }.start()
             }
@@ -92,8 +116,77 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     // MARK: Helpers
 
     private func finishSession() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        lastNetwork = nil
+        watchdog?.cancel()
+        watchdog = nil
+        reconnectDeadline = nil
+        pendingReconnect?.cancel()
+        pendingReconnect = nil
         if let s = session { ocb_free(s) }
         session = nil
+    }
+
+    /// On a network change, reconnect right away with the existing session
+    /// instead of waiting for the old connection to time out. Like Cisco's
+    /// client, this doesn't log in again, so there's no Duo push.
+    private func watchNetwork() {
+        guard session != nil, pathMonitor == nil else { return }
+        let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other, .loopback]) // skip our own tunnel
+        monitor.pathUpdateHandler = { [weak self] path in
+            guard let self, self.session != nil else { return }
+            // The first interface is the one in use. Its name alone misses Wi-Fi → Wi-Fi
+            // (both en0); the gateway differs.
+            let network = path.status != .satisfied ? "offline"
+                : ([path.availableInterfaces.first?.name ?? ""] + path.gateways.map { "\($0)" }.sorted()).joined(separator: ",")
+            defer { self.lastNetwork = network }
+            guard let last = self.lastNetwork, last != network else { return }
+            self.reconnecting()
+            guard network != "offline" else { return }
+            // Path updates come in bursts (interface, then gateways); reconnect once.
+            self.pendingReconnect?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, let s = self.session else { return }
+                self.log("Network changed; reconnecting with the existing session")
+                ocb_reconnect(s)
+            }
+            self.pendingReconnect = work
+            self.queue.asyncAfter(deadline: .now() + 1, execute: work)
+        }
+        pathMonitor = monitor
+        monitor.start(queue: queue)
+
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 60, repeating: 60)
+        timer.setEventHandler { [weak self] in self?.checkReconnect() }
+        timer.resume()
+        watchdog = timer
+    }
+
+    private func reconnecting() {
+        reasserting = true
+        if reconnectDeadline == nil {
+            reconnectDeadline = Date().addingTimeInterval(TimeInterval(Self.resumeWindow))
+        }
+    }
+
+    private func reconnected() {
+        reasserting = false
+        reconnectDeadline = nil
+    }
+
+    /// OpenConnect's retry timeout only counts its sleeps, and a connect or TLS
+    /// handshake can hang with no timeout. While reconnecting, retry every minute
+    /// and give up by the clock, so a full tunnel can't blackhole traffic for long.
+    private func checkReconnect() {
+        guard let s = session, let deadline = reconnectDeadline else { return }
+        if Date() >= deadline {
+            log("Couldn't reconnect in \(Self.resumeWindow / 60) minutes; ending the session")
+            ocb_cancel(s)
+        } else {
+            ocb_reconnect(s)
+        }
     }
 
     private func failure(_ message: String) -> NSError {

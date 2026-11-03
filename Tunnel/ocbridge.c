@@ -18,6 +18,7 @@ struct ocb_session {
     char *user, *password, *second;
     char *server;
     ocb_log_fn log;
+    ocb_event_fn event;
     void *ctx;
     bool answered_user, answered_password, answered_second;
     char auth_error[512];
@@ -39,6 +40,12 @@ static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
 // which include the submitted password.
 static void progress_cb(void *priv, int level, const char *fmt, ...) {
     struct ocb_session *s = priv;
+    // OpenConnect has no "reconnecting" callback. These messages mark a dropped
+    // connection it's retrying: a dead peer, or a failed attempt before its sleep.
+    // (Built without NLS, so the format strings are the English originals.)
+    if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
+                     !strncmp(fmt, "sleep %ds", 9)))
+        s->event(s->ctx, OCB_RECONNECTING);
     if (level > PRG_INFO || !s->log) return;
     char buf[1024];
     va_list ap;
@@ -135,8 +142,15 @@ static int validate_cert_cb(void *priv, const char *reason) {
     return ok ? 0 : 1;
 }
 
+static void reconnected_cb(void *priv) {
+    struct ocb_session *s = priv;
+    logf_(s, PRG_INFO, "Reconnected with the existing session");
+    if (s->event) s->event(s->ctx, OCB_RECONNECTED);
+}
+
 ocb_session *ocb_new(const char *server, const char *user, const char *password,
-                     const char *second_password, ocb_log_fn log, void *ctx) {
+                     const char *second_password, ocb_log_fn log,
+                     ocb_event_fn event, void *ctx) {
     static bool ssl_ready = false;
     if (!ssl_ready) { openconnect_init_ssl(); ssl_ready = true; }
 
@@ -147,11 +161,13 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     s->password = strdup(password);
     s->second = strdup(second_password);
     s->log = log;
+    s->event = event;
     s->ctx = ctx;
     s->vpn = openconnect_vpninfo_new(NULL, validate_cert_cb, NULL, auth_form_cb, progress_cb, s);
     if (!s->vpn) { ocb_free(s); return NULL; }
     openconnect_set_loglevel(s->vpn, PRG_INFO);
     openconnect_set_reported_os(s->vpn, "apple-ios");
+    openconnect_set_reconnected_handler(s->vpn, reconnected_cb);
     s->cmd_fd = openconnect_setup_cmd_pipe(s->vpn);
     return s;
 }
@@ -209,9 +225,18 @@ void ocb_config_free(ocb_config *c) {
     memset(c, 0, sizeof *c);
 }
 
-int ocb_run(ocb_session *s, int tun_fd) {
+int ocb_run(ocb_session *s, int tun_fd, int reconnect_timeout) {
     if (openconnect_setup_tun_fd(s->vpn, tun_fd)) return -1;
-    return openconnect_mainloop(s->vpn, 300, RECONNECT_INTERVAL_MIN);
+    int ret;
+    // Only a pause makes the mainloop return 0 (it closes its connections first).
+    // Calling it again reconnects with the session cookie: no new login or Duo push.
+    while ((ret = openconnect_mainloop(s->vpn, reconnect_timeout, RECONNECT_INTERVAL_MIN)) == 0) {}
+    return ret;
+}
+
+void ocb_reconnect(ocb_session *s) {
+    char cmd = OC_CMD_PAUSE;
+    if (s && s->cmd_fd >= 0) (void)!write(s->cmd_fd, &cmd, 1);
 }
 
 void ocb_cancel(ocb_session *s) {
