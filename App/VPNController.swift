@@ -53,6 +53,7 @@ final class VPNController: ObservableObject {
     func disconnect() async {
         lastError = nil
         guard let m = manager else { return }
+        try? await m.loadFromPreferences() // the Control Center toggle may have changed it
         if m.isOnDemandEnabled {
             m.isOnDemandEnabled = false
             try? await m.saveToPreferences()
@@ -95,6 +96,7 @@ final class VPNController: ObservableObject {
     private func savedManager(onDemand: Bool) async throws -> NETunnelProviderManager {
         await load()
         let m = manager!
+        try? await m.loadFromPreferences() // pick up changes from the toggle; fails if never saved
         let proto = (m.protocolConfiguration as? NETunnelProviderProtocol) ?? NETunnelProviderProtocol()
         proto.providerBundleIdentifier = AppConfig.tunnelBundleID
         proto.serverAddress = server.trimmingCharacters(in: .whitespaces)
@@ -112,6 +114,7 @@ final class VPNController: ObservableObject {
 
     private func applyAutoNetworks() async {
         guard let m = manager, m.protocolConfiguration != nil else { return }
+        try? await m.loadFromPreferences()
         m.onDemandRules = onDemandRules()
         if autoNetworks.isEmpty { m.isOnDemandEnabled = false }
         try? await m.saveToPreferences()

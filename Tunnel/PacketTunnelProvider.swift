@@ -25,8 +25,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         // Refresh the Control Center toggle whichever way this ends; otherwise it can
-        // keep showing "Connected" after a failed or dropped connection.
+        // keep showing "Connected" after a failed or dropped connection. Before the
+        // completion too: iOS may tear this process down right after a failure.
         let done: (Error?) -> Void = { error in
+            VPNQuickControl.reloadControl()
             completionHandler(error)
             VPNQuickControl.reloadControl()
         }
@@ -103,6 +105,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         case -EINTR: "Couldn't reconnect in \(Self.resumeWindow / 60) minutes. Connect again to log in."
                         default: "The VPN session ended."
                         }
+                        VPNQuickControl.reloadControl()
                         self.cancelTunnelWithError(self.failure(message))
                         VPNQuickControl.reloadControl()
                     }

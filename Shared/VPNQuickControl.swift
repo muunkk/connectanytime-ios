@@ -24,37 +24,75 @@ enum VPNQuickControl {
 
     static func set(_ on: Bool) async throws {
         guard let m = await manager(), m.protocolConfiguration != nil else { throw NotSetUp() }
-        logger.log("Control set \(on ? "on" : "off", privacy: .public); status \(m.connection.status.rawValue)")
+        let c = m.connection
+        logger.log("Control set \(on ? "on" : "off", privacy: .public); status \(describe(c.status), privacy: .public)")
+        defer { reloadControl() }
         if on {
-            // Connecting re-arms auto-connect, matching the app's Connect button. Best
-            // effort: if saving fails, still connect rather than silently doing nothing.
-            if !(m.onDemandRules ?? []).isEmpty, !m.isOnDemandEnabled {
-                m.isOnDemandEnabled = true
-                do {
-                    try await m.saveToPreferences()
-                    try await m.loadFromPreferences()
-                } catch {
-                    logger.error("Couldn't re-arm auto-connect: \(error.localizedDescription, privacy: .public)")
-                    try? await m.loadFromPreferences()
-                }
+            // iOS disables this configuration whenever another VPN is used. The app's
+            // Connect re-enables it on every save; the toggle has to as well.
+            if !m.isEnabled {
+                m.isEnabled = true
+                try await save(m, "re-enable the VPN")
             }
+            // A start sent while the last session is still shutting down is ignored.
+            await wait(c, whileIn: [.disconnecting])
             do {
-                try (m.connection as? NETunnelProviderSession)?
+                try (c as? NETunnelProviderSession)?
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
             } catch {
                 logger.error("Couldn't start the VPN: \(error.localizedDescription, privacy: .public)")
-                reloadControl()
                 throw error
             }
+            // Re-arm auto-connect only after starting, matching the app's Connect button.
+            // Re-arming first can make iOS start an automatic attempt that swallows this
+            // manual one. Best effort: the VPN is already connecting.
+            if !(m.onDemandRules ?? []).isEmpty, !m.isOnDemandEnabled {
+                m.isOnDemandEnabled = true
+                try? await save(m, "re-arm auto-connect")
+            }
+            await wait(c, whileIn: [.disconnected, .invalid])
         } else {
-            // Pause auto-connect so iOS doesn't reconnect straight away.
+            // Pause auto-connect so iOS doesn't reconnect straight away. Best effort:
+            // stopping matters more.
             if m.isOnDemandEnabled {
                 m.isOnDemandEnabled = false
-                try await m.saveToPreferences()
+                try? await save(m, "pause auto-connect")
             }
-            m.connection.stopVPNTunnel()
+            c.stopVPNTunnel()
+            await wait(c, whileIn: [.connected, .connecting, .reasserting])
         }
-        reloadControl()
+    }
+
+    private static func save(_ m: NETunnelProviderManager, _ what: String) async throws {
+        do {
+            try await m.saveToPreferences()
+            try await m.loadFromPreferences()
+        } catch {
+            logger.error("Couldn't \(what, privacy: .public): \(error.localizedDescription, privacy: .public)")
+            try? await m.loadFromPreferences() // drop the unsaved change
+            throw error
+        }
+    }
+
+    /// Control Center re-reads the toggle as soon as the action returns. Wait briefly
+    /// for the new state so it doesn't snap back to the old one.
+    private static func wait(_ c: NEVPNConnection, whileIn states: Set<NEVPNStatus>) async {
+        let deadline = Date().addingTimeInterval(2)
+        while states.contains(c.status), Date() < deadline {
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+    }
+
+    private static func describe(_ status: NEVPNStatus) -> String {
+        switch status {
+        case .invalid: "invalid"
+        case .disconnected: "disconnected"
+        case .connecting: "connecting"
+        case .connected: "connected"
+        case .reasserting: "reasserting"
+        case .disconnecting: "disconnecting"
+        @unknown default: "\(status.rawValue)"
+        }
     }
 
     /// Ask Control Center to re-read the toggle's state.
