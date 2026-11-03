@@ -24,17 +24,23 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let resumeWindow: Int32 = 30 * 60
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        // Refresh the Control Center toggle whichever way this ends; otherwise it can
+        // keep showing "Connected" after a failed or dropped connection.
+        let done: (Error?) -> Void = { error in
+            completionHandler(error)
+            VPNQuickControl.reloadControl()
+        }
         let manual = options?[AppConfig.manualStartKey] != nil
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
               let user = proto.username, !user.isEmpty else {
-            return completionHandler(failure("Open ConnectAnytime and enter your NetID."))
+            return done(failure("Open ConnectAnytime and enter your NetID."))
         }
         guard let password = SharedKeychain.read() else {
-            return completionHandler(failure("Open ConnectAnytime and save your password."))
+            return done(failure("Open ConnectAnytime and save your password."))
         }
         if !manual, let last = UserDefaults.standard.object(forKey: Self.lastAutoFailureKey) as? Date,
            Date().timeIntervalSince(last) < Self.autoRetryPause {
-            return completionHandler(failure("Auto-connect paused after a failed attempt. Tap Connect to try again."))
+            return done(failure("Auto-connect paused after a failed attempt. Tap Connect to try again."))
         }
         let server = proto.serverAddress ?? AppConfig.defaultServer
         log("Connecting to \(server) (\(manual ? "manual" : "auto"))")
@@ -51,7 +57,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     if event == Int32(OCB_RECONNECTED) { provider.reconnected() } else { provider.reconnecting() }
                 }
             }, ctx) else {
-                return completionHandler(self.failure("Couldn't start the VPN client."))
+                return done(self.failure("Couldn't start the VPN client."))
             }
             self.session = s
 
@@ -60,14 +66,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let message = self.stopping ? "Cancelled." : String(cString: err)
                 self.finishSession()
                 if !manual, !self.stopping { UserDefaults.standard.set(Date(), forKey: Self.lastAutoFailureKey) }
-                return completionHandler(self.failure(message))
+                return done(self.failure(message))
             }
             UserDefaults.standard.removeObject(forKey: Self.lastAutoFailureKey)
 
             var cfg = ocb_config()
             guard ocb_get_config(s, &cfg) == 0 else {
                 self.finishSession()
-                return completionHandler(self.failure("The server didn't send tunnel settings."))
+                return done(self.failure("The server didn't send tunnel settings."))
             }
             let settings = Self.networkSettings(cfg, server: server)
             ocb_config_free(&cfg)
@@ -75,16 +81,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             self.setTunnelNetworkSettings(settings) { error in
                 if let error {
                     self.queue.async { self.finishSession() }
-                    return completionHandler(self.failure("Couldn't apply VPN settings: \(error.localizedDescription)"))
+                    return done(self.failure("Couldn't apply VPN settings: \(error.localizedDescription)"))
                 }
                 let fd = ocb_find_utun_fd()
                 guard fd >= 0 else {
                     self.queue.async { self.finishSession() }
-                    return completionHandler(self.failure("Couldn't find the tunnel interface."))
+                    return done(self.failure("Couldn't find the tunnel interface."))
                 }
                 self.log("Connected")
-                completionHandler(nil)
-                VPNQuickControl.reloadControl()
+                done(nil)
                 self.queue.async { self.watchNetwork() }
 
                 Thread {
@@ -99,6 +104,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         default: "The VPN session ended."
                         }
                         self.cancelTunnelWithError(self.failure(message))
+                        VPNQuickControl.reloadControl()
                     }
                 }.start()
             }
