@@ -9,7 +9,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Guards freeing `session` against stopTunnel cancelling it. stopTunnel can't
     /// use `queue`: that's blocked while logging in (waiting for Duo).
     private let sessionLock = NSLock()
-    private var stopping = false
+    private var _stopping = false
+    /// Set by stopTunnel on iOS's thread, read on `queue`.
+    private var stopping: Bool { sessionLock.withLock { _stopping } }
     private var pathMonitor: NWPathMonitor?
     private var lastNetwork: String?
     private var watchdog: DispatchSourceTimer?
@@ -146,7 +148,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         log("Stopping (reason \(reason.rawValue))")
         sessionLock.withLock {
-            stopping = true
+            _stopping = true
             if let s = session { ocb_cancel(s) }
         }
         completionHandler()
@@ -219,7 +221,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         reconnectEpoch += 1
         if reconnectDeadline == nil {
             reconnectDeadline = Date().addingTimeInterval(TimeInterval(Self.resumeWindow))
-            lastReconnectKick = Date() // OpenConnect is already retrying
+            lastReconnectKick = Date() // give the attempt underway, or about to be kicked, its minute
         }
         if attempt { lastReconnectKick = Date() }
     }
@@ -285,9 +287,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     /// OpenConnect's retry timeout only counts its sleeps, and a connect or TLS
-    /// handshake can hang with no timeout. While reconnecting, retry once nothing has
-    /// happened for a minute (not sooner: that would abort an attempt in progress),
-    /// and give up by the clock, so a full tunnel can't blackhole traffic for long.
+    /// handshake can hang with no timeout. While reconnecting, retry a minute after
+    /// the latest attempt started (not sooner: that would abort it), and give up by
+    /// the clock, so a full tunnel can't blackhole traffic for long.
     private func checkReconnect() {
         guard let s = session, let deadline = reconnectDeadline else { return }
         if Date() >= deadline {
