@@ -15,9 +15,19 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var watchdog: DispatchSourceTimer?
     private var reconnectDeadline: Date?
     private var lastReconnectKick = Date.distantPast
-    /// Bumped whenever a reconnect starts, so a slow settings update from an
-    /// earlier reconnect can't mark a newer one as done.
+    /// Bumped whenever a reconnect starts, so the result of an earlier one (such as a
+    /// slow settings update) can't mark a newer one as done or end it.
     private var reconnectEpoch = 0
+    /// Tunnel settings: the last ones iOS confirmed, and the newest the server sent.
+    private var installedKey: String?
+    private var wanted: WantedSettings?
+    private var applyingSettings = false
+
+    private struct WantedSettings {
+        let key: String
+        let settings: NEPacketTunnelNetworkSettings
+        let epoch: Int // the reconnect that produced them
+    }
     private var pendingReconnect: DispatchWorkItem?
     private var server = ""
     /// Why the session ended, when it's our doing rather than OpenConnect's.
@@ -67,10 +77,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 guard let ctx else { return }
                 let provider = Unmanaged<PacketTunnelProvider>.fromOpaque(ctx).takeUnretainedValue()
                 // cfg is only valid during this call.
-                let settings = cfg.map { PacketTunnelProvider.networkSettings($0.pointee, server: provider.server) }
+                let config = cfg.map { (String(cString: $0.pointee.key),
+                                        PacketTunnelProvider.networkSettings($0.pointee, server: provider.server)) }
                 provider.queue.async {
-                    guard event == Int32(OCB_RECONNECTED) else { return provider.reconnecting() }
-                    if let settings { provider.reconfigure(settings) } else { provider.reconnected() }
+                    switch Int(event) {
+                    case Int(OCB_ATTEMPT): provider.reconnecting(attempt: true)
+                    case Int(OCB_RECONNECTED): provider.reconnected(config)
+                    default: provider.reconnecting()
+                    }
                 }
             }, ctx) else {
                 return done(self.failure("Couldn't start the VPN client."))
@@ -92,9 +106,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 return done(self.failure("The server didn't send tunnel settings."))
             }
             let settings = Self.networkSettings(cfg, server: server)
+            let key = String(cString: cfg.key)
             ocb_config_free(&cfg)
 
             self.setTunnelNetworkSettings(settings) { error in
+                self.queue.async { if error == nil { self.installedKey = key } }
                 if let error {
                     self.queue.async { self.finishSession() }
                     return done(self.failure("Couldn't apply VPN settings: \(error.localizedDescription)"))
@@ -149,6 +165,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         pendingReconnect?.cancel()
         pendingReconnect = nil
         endReason = nil
+        installedKey = nil
+        wanted = nil
+        applyingSettings = false
         sessionLock.withLock {
             if let s = session { ocb_free(s) }
             session = nil
@@ -193,40 +212,68 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         watchdog = timer
     }
 
-    private func reconnecting() {
+    /// `attempt`: OpenConnect is starting a connection attempt, so the watchdog
+    /// shouldn't abort it for another minute.
+    private func reconnecting(attempt: Bool = false) {
         reasserting = true
         reconnectEpoch += 1
         if reconnectDeadline == nil {
             reconnectDeadline = Date().addingTimeInterval(TimeInterval(Self.resumeWindow))
             lastReconnectKick = Date() // OpenConnect is already retrying
         }
+        if attempt { lastReconnectKick = Date() }
     }
 
-    private func reconnected() {
-        reasserting = false
-        reconnectDeadline = nil
-    }
-
-    /// The server assigned new tunnel settings on reconnect, typically a new address
-    /// because it hadn't yet noticed the old connection drop. The session is still
-    /// valid; apply them to the tunnel instead of ending it.
-    private func reconfigure(_ settings: NEPacketTunnelNetworkSettings) {
+    /// OpenConnect is back up. The server may have assigned new tunnel settings,
+    /// typically a new address because it hadn't yet noticed the old connection drop.
+    /// The session is still valid, so apply them instead of ending it. Reconnecting
+    /// is over once the tunnel has the newest settings.
+    private func reconnected(_ config: (key: String, settings: NEPacketTunnelNetworkSettings)?) {
         guard session != nil else { return }
+        if let config {
+            wanted = WantedSettings(key: config.key, settings: config.settings, epoch: reconnectEpoch)
+        } else if !applyingSettings {
+            return finishReconnect(epoch: reconnectEpoch) // couldn't read settings; keep the current ones
+        } else if let w = wanted {
+            wanted = WantedSettings(key: w.key, settings: w.settings, epoch: reconnectEpoch)
+        }
+        if !applyingSettings { applyWantedSettings() }
+    }
+
+    private func applyWantedSettings() {
+        guard session != nil, let want = wanted else { return }
+        guard want.key != installedKey else {
+            wanted = nil
+            return finishReconnect(epoch: want.epoch)
+        }
         log("Applying new tunnel settings from the server")
-        reasserting = true
-        let epoch = reconnectEpoch
-        setTunnelNetworkSettings(settings) { error in
+        applyingSettings = true
+        setTunnelNetworkSettings(want.settings) { error in
             self.queue.async {
                 guard let s = self.session else { return }
+                self.applyingSettings = false
+                if error == nil { self.installedKey = want.key }
+                if let newer = self.wanted, newer.epoch != want.epoch || newer.key != want.key {
+                    return self.applyWantedSettings() // the server sent newer settings meanwhile
+                }
+                self.wanted = nil
+                guard want.epoch == self.reconnectEpoch else { return } // a newer reconnect will apply its own
                 if let error {
                     self.endReason = "Couldn't apply new VPN settings: \(error.localizedDescription)"
                     self.log(self.endReason!)
                     ocb_cancel(s)
-                } else if epoch == self.reconnectEpoch {
-                    self.reconnected()
-                } // else another reconnect started meanwhile; its own result ends it
+                } else {
+                    self.finishReconnect(epoch: want.epoch)
+                }
             }
         }
+    }
+
+    /// Clears "Reconnecting…" unless another reconnect has started since.
+    private func finishReconnect(epoch: Int) {
+        guard epoch == reconnectEpoch else { return }
+        reasserting = false
+        reconnectDeadline = nil
     }
 
     /// Drop the current connection and reconnect now with the existing session.

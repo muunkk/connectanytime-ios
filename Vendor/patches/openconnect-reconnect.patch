@@ -74,13 +74,13 @@
  	/* Preserve gateway_addr and MTU if they were set */
 --- a/ssl.c
 +++ b/ssl.c
-@@ -1198,6 +1198,9 @@
- 	int interval;
- 	int tun_up = tun_is_up(vpninfo);
+@@ -1210,6 +1210,9 @@
+ 	vpninfo->tun_pkt = NULL;
  
-+	/* Lets the caller see every reconnect start, including ones after a TLS
-+	 * read or write error, which otherwise log nothing until an attempt fails. */
-+	vpn_progress(vpninfo, PRG_INFO, _("Reconnecting to the server\n"));
- 	openconnect_close_https(vpninfo, 0);
- 
- 
+ 	while (1) {
++		/* Lets the caller see each attempt start, including the first one after a
++		 * TLS read or write error, which otherwise logs nothing until it fails. */
++		vpn_progress(vpninfo, PRG_INFO, _("Reconnecting to the server\n"));
+ 		if (tun_up)
+ 			script_config_tun(vpninfo, "attempt-reconnect");
+ 		ret = vpninfo->proto->tcp_connect(vpninfo);
