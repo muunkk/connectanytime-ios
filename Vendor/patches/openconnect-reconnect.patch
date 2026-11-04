@@ -1,0 +1,86 @@
+--- a/library.c
++++ b/library.c
+@@ -646,7 +646,21 @@
+ 		free(opt->option);
+ 		free(opt->value);
+ 		free(opt);
++	}
++}
++
++static int check_reconnect_value(struct openconnect_info *vpninfo, const char *what,
++				 const char *now, const char *was)
++{
++	if (!was)
++		return 0;
++	if (!now) {
++		vpn_progress(vpninfo, PRG_ERR, _("Reconnect gave no %s (was %s)\n"), what, was);
++		return -EPERM;
+ 	}
++	if (strcmp(now, was))
++		vpn_progress(vpninfo, PRG_INFO, _("Reconnect gave a new %s (%s, was %s)\n"), what, now, was);
++	return 0;
+ }
+ 
+ int install_vpn_opts(struct openconnect_info *vpninfo, struct oc_vpn_option *opt,
+@@ -677,39 +691,16 @@
+ 		}
+ 	}
+ 
+-	if (vpninfo->ip_info.addr) {
+-		if (!ip_info->addr || strcmp(ip_info->addr, vpninfo->ip_info.addr)) {
+-			vpn_progress(vpninfo, PRG_ERR,
+-				     _("Reconnect gave different Legacy IP address (%s != %s)\n"),
+-				     ip_info->addr, vpninfo->ip_info.addr);
+-			/* EPERM means that the retry loop will abort and won't keep trying. */
+-			return -EPERM;
+-		}
+-	}
+-	if (vpninfo->ip_info.netmask) {
+-		if (!ip_info->netmask || strcmp(ip_info->netmask, vpninfo->ip_info.netmask)) {
+-			vpn_progress(vpninfo, PRG_ERR,
+-				     _("Reconnect gave different Legacy IP netmask (%s != %s)\n"),
+-				     ip_info->netmask, vpninfo->ip_info.netmask);
+-			return -EPERM;
+-		}
+-	}
+-	if (vpninfo->ip_info.addr6) {
+-		if (!ip_info->addr6 || strcmp(ip_info->addr6, vpninfo->ip_info.addr6)) {
+-			vpn_progress(vpninfo, PRG_ERR,
+-				     _("Reconnect gave different IPv6 address (%s != %s)\n"),
+-				     ip_info->addr6, vpninfo->ip_info.addr6);
+-			return -EPERM;
+-		}
+-	}
+-	if (vpninfo->ip_info.netmask6) {
+-		if (!ip_info->netmask6 || strcmp(ip_info->netmask6, vpninfo->ip_info.netmask6)) {
+-			vpn_progress(vpninfo, PRG_ERR,
+-				     _("Reconnect gave different IPv6 netmask (%s != %s)\n"),
+-				     ip_info->netmask6, vpninfo->ip_info.netmask6);
+-			return -EPERM;
+-		}
+-	}
++	/* A Cisco ASA can hand out a new address when the client reconnects from
++	 * another network before the server has noticed the old connection died.
++	 * The session is still valid, so accept the new settings; the caller
++	 * reconfigures its tunnel when they change. Only a missing address ends it. */
++	if (check_reconnect_value(vpninfo, "Legacy IP address", ip_info->addr, vpninfo->ip_info.addr) ||
++	    check_reconnect_value(vpninfo, "Legacy IP netmask", ip_info->netmask, vpninfo->ip_info.netmask) ||
++	    check_reconnect_value(vpninfo, "IPv6 address", ip_info->addr6, vpninfo->ip_info.addr6) ||
++	    check_reconnect_value(vpninfo, "IPv6 netmask", ip_info->netmask6, vpninfo->ip_info.netmask6))
++		/* EPERM means that the retry loop will abort and won't keep trying. */
++		return -EPERM;
+ 
+  after_ip_checks:
+ 	/* Preserve gateway_addr and MTU if they were set */
+--- a/ssl.c
++++ b/ssl.c
+@@ -1198,6 +1198,9 @@
+ 	int interval;
+ 	int tun_up = tun_is_up(vpninfo);
+ 
++	/* Lets the caller see every reconnect start, including ones after a TLS
++	 * read or write error, which otherwise log nothing until an attempt fails. */
++	vpn_progress(vpninfo, PRG_INFO, _("Reconnecting to the server\n"));
+ 	openconnect_close_https(vpninfo, 0);
+ 
+ 

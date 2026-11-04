@@ -22,7 +22,10 @@ struct ocb_session {
     void *ctx;
     bool answered_user, answered_password, answered_second;
     char auth_error[512];
+    char *applied; // config_key() of the tunnel settings last handed to the caller
 };
+
+static void reconnected_cb(void *priv);
 
 static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
     if (!s->log) return;
@@ -40,12 +43,13 @@ static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
 // which include the submitted password.
 static void progress_cb(void *priv, int level, const char *fmt, ...) {
     struct ocb_session *s = priv;
-    // OpenConnect has no "reconnecting" callback. These messages mark a dropped
-    // connection it's retrying: a dead peer, or a failed attempt before its sleep.
+    // OpenConnect has no "reconnecting" callback. Our patch logs one at the start of
+    // every reconnect; a dead peer or a failed attempt's sleep mean the same.
     // (Built without NLS, so the format strings are the English originals.)
-    if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
+    if (s->event && (!strcmp(fmt, "Reconnecting to the server\n") ||
+                     !strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
                      !strncmp(fmt, "sleep %ds", 9)))
-        s->event(s->ctx, OCB_RECONNECTING);
+        s->event(s->ctx, OCB_RECONNECTING, NULL);
     if (level > PRG_INFO || !s->log) return;
     char buf[1024];
     va_list ap;
@@ -142,12 +146,6 @@ static int validate_cert_cb(void *priv, const char *reason) {
     return ok ? 0 : 1;
 }
 
-static void reconnected_cb(void *priv) {
-    struct ocb_session *s = priv;
-    logf_(s, PRG_INFO, "Reconnected with the existing session");
-    if (s->event) s->event(s->ctx, OCB_RECONNECTED);
-}
-
 ocb_session *ocb_new(const char *server, const char *user, const char *password,
                      const char *second_password, ocb_log_fn log,
                      ocb_event_fn event, void *ctx) {
@@ -200,7 +198,7 @@ static char *join_routes(struct oc_split_include *list) {
     return out;
 }
 
-int ocb_get_config(ocb_session *s, ocb_config *out) {
+static int read_config(ocb_session *s, ocb_config *out) {
     const struct oc_ip_info *ip = NULL;
     memset(out, 0, sizeof *out);
     if (openconnect_get_ip_info(s->vpn, &ip, NULL, NULL) || !ip || !ip->addr) return -1;
@@ -215,6 +213,45 @@ int ocb_get_config(ocb_session *s, ocb_config *out) {
     out->split_dns = join_routes(ip->split_dns);
     out->mtu = ip->mtu;
     return 0;
+}
+
+/// Everything the tunnel settings are built from, to tell whether they changed.
+static char *config_key(const ocb_config *c) {
+    const char *parts[] = { c->addr, c->netmask, c->addr6, c->dns[0], c->dns[1], c->dns[2],
+                            c->domain, c->gateway, c->split_includes, c->split_excludes, c->split_dns };
+    size_t n = sizeof parts / sizeof *parts, len = 16;
+    for (size_t i = 0; i < n; i++) len += (parts[i] ? strlen(parts[i]) : 0) + 1;
+    char *key = calloc(1, len), *p = key;
+    if (!key) return NULL;
+    for (size_t i = 0; i < n; i++) p += sprintf(p, "%s|", parts[i] ? parts[i] : "");
+    sprintf(p, "%d", c->mtu);
+    return key;
+}
+
+int ocb_get_config(ocb_session *s, ocb_config *out) {
+    if (read_config(s, out)) return -1;
+    free(s->applied);
+    s->applied = config_key(out);
+    return 0;
+}
+
+// Runs on ocb_run's thread, after OpenConnect reconnected with the session cookie.
+// The server may have assigned a new address; if so, hand the caller the new settings.
+static void reconnected_cb(void *priv) {
+    struct ocb_session *s = priv;
+    logf_(s, PRG_INFO, "Reconnected with the existing session");
+    ocb_config cfg;
+    char *key = read_config(s, &cfg) == 0 ? config_key(&cfg) : NULL;
+    bool changed = key && (!s->applied || strcmp(key, s->applied));
+    if (changed) {
+        logf_(s, PRG_INFO, "Tunnel settings changed (address %s)", cfg.addr ? cfg.addr : "?");
+        free(s->applied);
+        s->applied = key;
+        key = NULL;
+    }
+    if (s->event) s->event(s->ctx, OCB_RECONNECTED, changed ? &cfg : NULL);
+    free(key);
+    ocb_config_free(&cfg);
 }
 
 void ocb_config_free(ocb_config *c) {
@@ -257,6 +294,7 @@ void ocb_free(ocb_session *s) {
     wipe_free(s->second);
     free(s->user);
     free(s->server);
+    free(s->applied);
     free(s);
 }
 

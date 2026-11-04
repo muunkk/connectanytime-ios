@@ -7,8 +7,6 @@
 
 typedef struct ocb_session ocb_session;
 typedef void (*ocb_log_fn)(void *ctx, int level, const char *line);
-enum { OCB_RECONNECTING, OCB_RECONNECTED };
-typedef void (*ocb_event_fn)(void *ctx, int event);
 
 /// Tunnel settings pushed by the server. Strings are owned by the struct.
 typedef struct {
@@ -23,6 +21,11 @@ typedef struct {
     int mtu;
 } ocb_config;
 
+enum { OCB_RECONNECTING, OCB_RECONNECTED };
+/// `cfg` is NULL except for OCB_RECONNECTED when the server sent different tunnel
+/// settings (e.g. a new address) than last time; it's only valid during the call.
+typedef void (*ocb_event_fn)(void *ctx, int event, const ocb_config *cfg);
+
 ocb_session *ocb_new(const char *server, const char *user, const char *password,
                      const char *second_password, ocb_log_fn log,
                      ocb_event_fn event, void *ctx);
@@ -31,6 +34,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
 /// VPN session. Blocks until Duo is approved or rejected. 0 on success.
 int ocb_connect(ocb_session *s, char *err, size_t errlen);
 
+/// Also remembers these settings, to report changes after a reconnect.
 int ocb_get_config(ocb_session *s, ocb_config *out);
 void ocb_config_free(ocb_config *c);
 
