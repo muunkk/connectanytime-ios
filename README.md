@@ -19,7 +19,8 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
   and the VPN reconnects with the session it already has, like Cisco's client. No new
   login, no new Duo push, as long as the server still holds the session. It usually
   reconnects within seconds, and keeps trying for up to 30 minutes; meanwhile traffic
-  waits rather than bypassing the VPN.
+  waits rather than bypassing the VPN. If the server gives the phone a new VPN address
+  when it reconnects, the tunnel switches to it instead of disconnecting.
 - **Full tunnel**, like NYU's Cisco setup. IPv6 is dropped rather than bypassing the VPN.
 
 ## How it works
@@ -60,7 +61,8 @@ match.
 ## Licenses
 
 ConnectAnytime's own code is MIT (see `LICENSE`). The build downloads and statically links
-OpenConnect (LGPL-2.1) and OpenSSL (Apache-2.0). If you distribute built binaries, you
-must meet the LGPL's terms for OpenConnect.
+OpenConnect (LGPL-2.1), with the small changes in `Vendor/patches`, and OpenSSL
+(Apache-2.0). If you distribute built binaries, you must meet the LGPL's terms for
+OpenConnect.
 
 Not affiliated with Cisco or NYU.

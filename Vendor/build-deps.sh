@@ -31,9 +31,14 @@ if [[ ! -f "$OUT/lib/libssl.a" ]]; then
 fi
 
 # --- OpenConnect -----------------------------------------------------------
-if [[ ! -f "$OUT/lib/libopenconnect.a" ]]; then
+# Our fixes live in patches/; rebuild whenever they change.
+PATCHES=(patches/openconnect-*.patch(N))
+STAMP="$OUT/lib/openconnect-patches.sha256"
+PATCH_SUM=$(cat "${PATCHES[@]}" </dev/null | shasum -a 256 | awk '{print $1}')
+if [[ ! -f "$OUT/lib/libopenconnect.a" || "$(cat "$STAMP" 2>/dev/null)" != "$PATCH_SUM" ]]; then
   fetch "https://www.infradead.org/openconnect/download/$OPENCONNECT.tar.gz" "$OPENCONNECT.tar.gz" "$OPENCONNECT_SHA256"
   rm -rf "src/$OPENCONNECT" && tar -xzf "src/$OPENCONNECT.tar.gz" -C src
+  for p in "${PATCHES[@]}"; do patch -d "src/$OPENCONNECT" -p1 --forward < "$p"; done
   CC="$(xcrun --sdk iphoneos -f clang)"
   CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=$MIN_IOS -O2"
   (cd "src/$OPENCONNECT" &&
@@ -48,6 +53,7 @@ if [[ ! -f "$OUT/lib/libopenconnect.a" ]]; then
       --without-gssapi --without-lz4 --without-java \
       --with-vpnc-script=/var/empty/vpnc-script &&
     make -j"$JOBS" libopenconnect.la && make install-libLTLIBRARIES install-includeHEADERS)
+  echo "$PATCH_SUM" > "$STAMP"
 fi
 echo "Built into $OUT"
 ls "$OUT/lib"/*.a

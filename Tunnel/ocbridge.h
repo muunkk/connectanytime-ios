@@ -7,8 +7,6 @@
 
 typedef struct ocb_session ocb_session;
 typedef void (*ocb_log_fn)(void *ctx, int level, const char *line);
-enum { OCB_RECONNECTING, OCB_RECONNECTED };
-typedef void (*ocb_event_fn)(void *ctx, int event);
 
 /// Tunnel settings pushed by the server. Strings are owned by the struct.
 typedef struct {
@@ -21,7 +19,15 @@ typedef struct {
     char *split_excludes;
     char *split_dns;
     int mtu;
+    char *key;                // all of the above in one string, to tell configs apart
 } ocb_config;
+
+/// OCB_RECONNECTING: the connection dropped and OpenConnect is retrying.
+/// OCB_ATTEMPT: a reconnect attempt is starting.
+/// OCB_RECONNECTED: back up; `cfg` holds the server's (possibly new) tunnel settings.
+/// `cfg` is NULL for the other events, and only valid during the call.
+enum { OCB_RECONNECTING, OCB_ATTEMPT, OCB_RECONNECTED };
+typedef void (*ocb_event_fn)(void *ctx, int event, const ocb_config *cfg);
 
 ocb_session *ocb_new(const char *server, const char *user, const char *password,
                      const char *second_password, ocb_log_fn log,
