@@ -232,6 +232,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// is over once the tunnel has the newest settings.
     private func reconnected(_ config: (key: String, settings: NEPacketTunnelNetworkSettings)?) {
         guard session != nil else { return }
+        lastReconnectKick = Date() // it's up: don't let the watchdog drop it while settings apply
         if let config {
             wanted = WantedSettings(key: config.key, settings: config.settings, epoch: reconnectEpoch)
         } else if !applyingSettings {
