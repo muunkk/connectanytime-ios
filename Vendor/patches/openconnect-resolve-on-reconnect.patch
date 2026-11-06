@@ -1,0 +1,48 @@
+--- a/ssl.c
++++ b/ssl.c
+@@ -271,7 +271,10 @@
+ 	   just reuse its previous IP address. If we're talking to a proxy, we
+ 	   can use *its* previous IP address. We expect it'll redo the DNS
+ 	   lookup for the server anyway. */
+-	if (vpninfo->peer_addr && (!vpninfo->is_dyndns || vpninfo->proxy)) {
++	/* Look the server up again on every connection, as for dynamic DNS, falling
++	 * back to the cached address. A phone changes networks: an address from one,
++	 * e.g. a NAT64-translated one from cellular, may not work on the next. */
++	if (vpninfo->peer_addr && vpninfo->proxy) {
+ 	reconnect:
+ #ifdef SOCK_CLOEXEC
+ 		ssl_sock = socket(vpninfo->peer_addr->sa_family, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_IP);
+@@ -322,6 +325,7 @@
+ 		struct addrinfo hints, *result, *rp;
+ 		char *hostname;
+ 		char port[6];
++		int cached_failed = 0;
+ 
+ 		memset(&hints, 0, sizeof(struct addrinfo));
+ 		hints.ai_family = AF_UNSPEC;
+@@ -528,13 +532,9 @@
+ 			 * don't bother falling back to it if it didn't work. */
+ 			if (vpninfo->peer_addr && vpninfo->peer_addrlen == rp->ai_addrlen &&
+ 			    match_sockaddr(vpninfo->peer_addr, rp->ai_addr)) {
+-				vpn_progress(vpninfo, PRG_TRACE,
+-					     _("Forgetting non-functional previous peer address\n"));
+-				free(vpninfo->peer_addr);
+-				vpninfo->peer_addr = NULL;
+-				vpninfo->peer_addrlen = 0;
+-				free(vpninfo->ip_info.gateway_addr);
+-				vpninfo->ip_info.gateway_addr = NULL;
++				/* Keep it: DTLS and MTU code read peer_addr without checking
++				 * for NULL, and may run before the next TLS connection. */
++				cached_failed = 1;
+ 			}
+ 		}
+ 		freeaddrinfo(result);
+@@ -544,7 +544,7 @@
+ 				     _("Failed to connect to host %s\n"),
+ 				     vpninfo->proxy?:vpninfo->hostname);
+ 			ssl_sock = -EINVAL;
+-			if (vpninfo->peer_addr) {
++			if (vpninfo->peer_addr && !cached_failed) {
+ 				vpn_progress(vpninfo, PRG_ERR,
+ 					     _("Reconnecting to DynDNS server using previously cached IP address\n"));
+ 				goto reconnect;

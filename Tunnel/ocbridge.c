@@ -188,7 +188,7 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Logged in, but couldn't open the VPN session.");
         return -1;
     }
-    // Reconnects look the name up again (see ocb_run); keep them on this server.
+    // Reconnects look the name up again (see Vendor/patches); keep them on this server.
     pin_server(s, openconnect_get_dnsname(s->vpn), openconnect_get_hostname(s->vpn));
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
@@ -203,6 +203,12 @@ static bool has_family(const struct addrinfo *list, int family) {
     return false;
 }
 
+static bool has_address(const struct addrinfo *list, const struct addrinfo *a) {
+    for (; list; list = list->ai_next)
+        if (list->ai_addrlen == a->ai_addrlen && !memcmp(list->ai_addr, a->ai_addr, a->ai_addrlen)) return true;
+    return false;
+}
+
 static struct addrinfo *append(struct addrinfo *head, struct addrinfo *tail) {
     if (!head) return tail;
     struct addrinfo *last = head;
@@ -214,10 +220,12 @@ static struct addrinfo *append(struct addrinfo *head, struct addrinfo *tail) {
 // Like openconnect's --resolve: send the server's name to the address the session
 // was made on, so a round-robin DNS answer can't hand the cookie to another server.
 // The normal answers are tried too (in order, as openconnect's own --resolve merges
-// them), since the pinned address may not work on this network: one made on an
-// IPv6-only (NAT64) network is a translated IPv6 address, useless on IPv4 Wi-Fi, and
-// can hang rather than fail. So it goes first only if this network's answers include
-// its kind of address, or there are none.
+// them), since the pinned address may not work on this network. The server has only
+// an IPv4 address, so a session made on an IPv6-only (NAT64) network, often cellular,
+// is pinned to a translated IPv6 address that works only on that network: on Wi-Fi it
+// fails, or hangs past the watchdog. So the pin goes first only when it's usable here:
+// an IPv4 one (iOS translates it on NAT64 networks) if this network has that kind of
+// address, an IPv6 one only if this network's answers include it.
 static int pinned_getaddrinfo(void *priv, const char *node, const char *service,
                               const struct addrinfo *hints, struct addrinfo **res) {
     struct ocb_session *s = priv;
@@ -228,7 +236,8 @@ static int pinned_getaddrinfo(void *priv, const char *node, const char *service,
     int normal_err = getaddrinfo(node, service, hints, &normal);
     if (pinned_err) { *res = normal; return normal_err; }
     if (normal_err) { *res = pinned; return 0; }
-    *res = has_family(normal, pinned->ai_family) ? append(pinned, normal) : append(normal, pinned);
+    bool usable = strchr(s->pin_ip, ':') ? has_address(normal, pinned) : has_family(normal, pinned->ai_family);
+    *res = usable ? append(pinned, normal) : append(normal, pinned);
     return 0;
 }
 
@@ -355,19 +364,7 @@ int ocb_run(ocb_session *s, int tun_fd, int reconnect_timeout) {
     int ret;
     // Only a pause makes the mainloop return 0 (it closes its connections first).
     // Calling it again reconnects with the session cookie: no new login or Duo push.
-    while ((ret = openconnect_mainloop(s->vpn, reconnect_timeout, RECONNECT_INTERVAL_MIN)) == 0) {
-        // A pause means the network changed, or a reconnect is stuck. Left alone,
-        // OpenConnect reconnects only to the address it last used, which may not work
-        // on the new network: from cellular, often a NAT64 address Wi-Fi can't reach.
-        // Setting the name again drops that address, so the next attempt looks the
-        // server up on this network (pinned to the session's server, see pin_server).
-        const char *name = openconnect_get_dnsname(s->vpn);
-        char *copy = name ? strdup(name) : NULL;
-        if (copy) {
-            openconnect_set_hostname(s->vpn, copy);
-            free(copy);
-        }
-    }
+    while ((ret = openconnect_mainloop(s->vpn, reconnect_timeout, RECONNECT_INTERVAL_MIN)) == 0) {}
     return ret;
 }
 

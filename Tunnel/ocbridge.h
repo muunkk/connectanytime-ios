@@ -63,8 +63,8 @@ void ocb_config_free(ocb_config *c);
 int ocb_run(ocb_session *s, int tun_fd, int reconnect_timeout);
 
 /// Thread-safe: drops the current connection and reconnects right away with
-/// the existing session, e.g. after switching networks. The reconnect looks the
-/// server up again on the current network, instead of reusing the last address.
+/// the existing session, e.g. after switching networks. Reconnects look the server
+/// up again on the current network, falling back to the last address.
 void ocb_reconnect(ocb_session *s);
 
 /// Thread-safe: aborts ocb_connect or ocb_run, logging out of the server's session.
