@@ -39,8 +39,12 @@ enum VPNQuickControl {
                 m.isOnDemandEnabled = false
                 try await save(m, "prepare to connect")
             }
-            // A start sent while the last session is still shutting down is ignored.
-            await wait(c, whileIn: [.disconnecting])
+            // A start sent while another attempt is running or stopping is ignored.
+            switch await settle(c) {
+            case .connected, .reasserting: return await armIfConnected(m)
+            case .disconnected, .invalid: break
+            default: return logger.error("The last attempt is still stopping; not starting")
+            }
             do {
                 try (c as? NETunnelProviderSession)?
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
@@ -95,6 +99,16 @@ enum VPNQuickControl {
             m.isOnDemandEnabled = false
             try? await m.saveToPreferences()
         }
+    }
+
+    /// Lets an attempt already under way (iOS's automatic one) finish, for up to 10 s,
+    /// then stops it. Call with on-demand saved off, so iOS doesn't start another, and
+    /// never during a login of our own. Returns the status it ends in.
+    static func settle(_ c: NEVPNConnection) async -> NEVPNStatus {
+        await wait(c, whileIn: [.connecting], upTo: 10)
+        if c.status == .connecting { c.stopVPNTunnel() }
+        await wait(c, whileIn: [.connecting, .disconnecting], upTo: 5)
+        return c.status
     }
 
     /// Waits up to `seconds` while the connection is in one of `states`. Control Center

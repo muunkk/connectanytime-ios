@@ -66,6 +66,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         queue.async {
             var err = [CChar](repeating: 0, count: 512)
             var session: OpaquePointer?
+            var rejoined: SavedSession?
 
             // Rejoin the session from the last login if the server still has it: no
             // password, no Duo. This is how Stay Connected comes back after iOS stops
@@ -77,6 +78,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 let result = ocb_resume(s, saved.url, saved.cookie, saved.dnsName, saved.ip, &err, err.count)
                 if result == 0 {
                     session = s
+                    rejoined = saved
                 } else {
                     let message = String(cString: err)
                     self.finishSession()
@@ -113,8 +115,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if let url = ocb_session_url(s), let cookie = ocb_session_cookie(s) {
                 SessionStore.save(.init(server: server, user: user,
                                         url: String(cString: url), cookie: String(cString: cookie),
-                                        dnsName: ocb_session_dnsname(s).map { String(cString: $0) },
-                                        ip: ocb_session_ip(s).map { String(cString: $0) }))
+                                        // A rejoin keeps the login's address: on an IPv6-only
+                                        // network it would read as a translated one.
+                                        dnsName: rejoined?.dnsName ?? ocb_session_dnsname(s).map { String(cString: $0) },
+                                        ip: rejoined?.ip ?? ocb_session_ip(s).map { String(cString: $0) }))
             }
             // Stopped just as the login finished: don't bring the tunnel up, and don't keep
             // a session you just disconnected.
@@ -407,13 +411,13 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private enum SessionStore {
         static func load() -> SavedSession? {
-            KeychainItem.read("session").flatMap { try? JSONDecoder().decode(SavedSession.self, from: Data($0.utf8)) }
+            KeychainItem.read(SavedSessionItem.account).flatMap { try? JSONDecoder().decode(SavedSession.self, from: Data($0.utf8)) }
         }
         static func save(_ session: SavedSession) {
             guard let data = try? JSONEncoder().encode(session) else { return }
-            KeychainItem.save(String(decoding: data, as: UTF8.self), as: "session")
+            KeychainItem.save(String(decoding: data, as: UTF8.self), as: SavedSessionItem.account)
         }
-        static func clear() { KeychainItem.delete("session") }
+        static func clear() { KeychainItem.delete(SavedSessionItem.account) }
     }
 
     private func failure(_ message: String) -> NSError {

@@ -197,11 +197,22 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
 
 // Like openconnect's --resolve: send the server's name to the address the session
 // was made on, so a round-robin DNS answer can't hand the cookie to another server.
+// The normal answers follow, in case the pinned address can't be reached from this
+// network (the list is tried in order, as openconnect's own --resolve merges them).
 static int pinned_getaddrinfo(void *priv, const char *node, const char *service,
                               const struct addrinfo *hints, struct addrinfo **res) {
     struct ocb_session *s = priv;
-    if (node && s->pin_name && s->pin_ip && !strcasecmp(node, s->pin_name)) node = s->pin_ip;
-    return getaddrinfo(node, service, hints, res);
+    if (!node || !s->pin_name || !s->pin_ip || strcasecmp(node, s->pin_name))
+        return getaddrinfo(node, service, hints, res);
+    struct addrinfo *pinned = NULL, *normal = NULL;
+    int pinned_err = getaddrinfo(s->pin_ip, service, hints, &pinned);
+    int normal_err = getaddrinfo(node, service, hints, &normal);
+    if (pinned_err) { *res = normal; return normal_err; }
+    struct addrinfo *tail = pinned;
+    while (tail->ai_next) tail = tail->ai_next;
+    tail->ai_next = normal_err ? NULL : normal;
+    *res = pinned;
+    return 0;
 }
 
 int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *dnsname,

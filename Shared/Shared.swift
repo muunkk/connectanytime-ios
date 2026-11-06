@@ -33,6 +33,12 @@ enum ConnectIntent {
     }
 }
 
+/// The VPN session the tunnel can rejoin without logging in (written by the tunnel).
+enum SavedSessionItem {
+    static let account = "session"
+    static var exists: Bool { KeychainItem.read(account) != nil }
+}
+
 /// Generic-password items in the Keychain group the app and its extensions share.
 /// Readable after first unlock so auto-connect works with the phone locked.
 enum KeychainItem {

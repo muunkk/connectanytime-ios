@@ -56,6 +56,7 @@ final class VPNController: ObservableObject {
             inOrder { await self.applyOnDemand() } // records the version once saved
         }
         armOnDemandIfConnected() // e.g. connected from Control Center while the app wasn't running
+        disarmIfNothingToRejoin()
     }
 
     /// Re-reads the VPN status, e.g. on returning from the Duo app.
@@ -75,9 +76,16 @@ final class VPNController: ObservableObject {
         ConnectIntent.set(disconnected: false)
         await inOrder {
             guard let m = self.manager else { return }
-            guard await self.makeWayForLogin(m) else { return }
+            guard await self.mayStartLogin(m) else { return }
             do {
-                let m = try await self.savedManager()
+                let m = try await self.savedManager() // saves on-demand off
+                // iOS may have an automatic attempt under way (it can only rejoin); a start
+                // sent while one is running or stopping is ignored.
+                switch await VPNQuickControl.settle(m.connection) {
+                case .connected, .reasserting: return
+                case .disconnected, .invalid: break
+                default: return self.lastError = "The last attempt is still stopping. Tap Connect again in a moment."
+                }
                 // Auto-connect stays off until the VPN is up (see armOnDemandIfConnected).
                 try (m.connection as? NETunnelProviderSession)?
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
@@ -89,24 +97,33 @@ final class VPNController: ObservableObject {
         }.value
     }
 
-    /// Whether Connect should start a login now. Not if the VPN is up, or our own
-    /// login is waiting for Duo (say a Shortcut run twice): saving the configuration
-    /// then could restart it. A manual login always turns on-demand off first, so
-    /// connecting with it on is iOS's automatic attempt, which can only rejoin. Give
-    /// that a moment, in case it gets the session back, then stop it and log in.
-    private func makeWayForLogin(_ m: NETunnelProviderManager) async -> Bool {
+    /// Whether Connect should go ahead. Not if the VPN is up, or our own login is
+    /// waiting for Duo (say a Shortcut run twice): saving the configuration then could
+    /// restart it. A manual login always saves on-demand off first, so connecting with
+    /// it on is iOS's automatic attempt, which Connect takes over from.
+    private func mayStartLogin(_ m: NETunnelProviderManager) async -> Bool {
         try? await m.loadFromPreferences()
-        let c = m.connection
-        if [.connected, .reasserting].contains(c.status) { return false }
-        guard c.status == .connecting else { return true }
-        guard m.isOnDemandEnabled else { return false }
-        m.isOnDemandEnabled = false
-        try? await m.saveToPreferences()
-        await VPNQuickControl.wait(c, whileIn: [.connecting], upTo: 10)
-        if c.status == .connected { return false }
-        if c.status == .connecting { c.stopVPNTunnel() }
-        await VPNQuickControl.wait(c, whileIn: [.connecting, .disconnecting], upTo: 5)
-        return true
+        switch m.connection.status {
+        case .connected, .reasserting: return false
+        case .connecting: return m.isOnDemandEnabled
+        default: return true
+        }
+    }
+
+    /// With no session to rejoin, iOS's automatic attempts can only fail ("tap Connect
+    /// to log in"), so turn them off, as Cisco's client stops once the session ends.
+    /// Mostly for a phone updated from a build that left on-demand on: otherwise the
+    /// button keeps flipping to Disconnect while iOS retries. Safe because on-demand is
+    /// only turned on once connected, and the session is saved before that.
+    private func disarmIfNothingToRejoin() {
+        guard [.disconnected, .invalid].contains(status), let m = manager, !SavedSessionItem.exists else { return }
+        inOrder {
+            try? await m.loadFromPreferences()
+            guard m.isOnDemandEnabled, [.disconnected, .invalid].contains(m.connection.status),
+                  !SavedSessionItem.exists else { return }
+            m.isOnDemandEnabled = false
+            try? await m.saveToPreferences()
+        }
     }
 
     /// Also pauses auto-connect and Stay Connected, otherwise iOS would reconnect
@@ -261,6 +278,7 @@ final class VPNController: ObservableObject {
             inOrder { await self.applyOnDemand() }
         }
         if status == .connected { armOnDemandIfConnected() }
+        if status == .disconnected { disarmIfNothingToRejoin() }
         VPNQuickControl.reloadControl()
         if status == .disconnected, old != .disconnected {
             m.connection.fetchLastDisconnectError { error in
