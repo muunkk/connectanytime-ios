@@ -35,10 +35,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Why the session ended, when it's our doing rather than OpenConnect's.
     private var endReason: String?
 
-    /// After an auto-connect fails (e.g. Duo ignored), don't let iOS's on-demand
-    /// retries keep sending Duo pushes. Manual connects are never blocked.
+    /// After an auto-connect fails, don't let iOS's on-demand retries keep sending
+    /// Duo pushes or trying a wrong password. Each such failure in a row doubles the
+    /// pause, so an ignored push overnight doesn't repeat every 15 minutes. Failing
+    /// before that (no network yet) pauses briefly, to avoid a storm of attempts.
+    /// Manual connects are never blocked.
     private static let autoRetryPause: TimeInterval = 15 * 60
-    private static let lastAutoFailureKey = "lastAutoFailure"
+    private static let maxAutoRetryPause: TimeInterval = 4 * 60 * 60
+    private static let unreachablePause: TimeInterval = 60
+    private static let autoPausedUntilKey = "autoPausedUntil"
+    private static let autoFailuresKey = "autoFailures"
 
     /// How long to keep retrying a dropped connection with the existing session
     /// (no Duo) before giving up, e.g. while walking between Wi-Fi networks.
@@ -62,8 +68,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let password = SharedKeychain.read() else {
             return done(failure("Open ConnectAnytime and save your password."))
         }
-        if !manual, let last = UserDefaults.standard.object(forKey: Self.lastAutoFailureKey) as? Date,
-           Date().timeIntervalSince(last) < Self.autoRetryPause {
+        if !manual, let until = UserDefaults.standard.object(forKey: Self.autoPausedUntilKey) as? Date,
+           Date() < until {
             return done(failure("Auto-connect paused after a failed attempt. Tap Connect to try again."))
         }
         let server = proto.serverAddress ?? AppConfig.defaultServer
@@ -96,11 +102,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             var err = [CChar](repeating: 0, count: 512)
             guard ocb_connect(s, &err, err.count) == 0 else {
                 let message = self.stopping ? "Cancelled." : String(cString: err)
+                if !manual, !self.stopping { Self.pauseAutoConnect(sentCredentials: ocb_sent_credentials(s) != 0) }
                 self.finishSession()
-                if !manual, !self.stopping { UserDefaults.standard.set(Date(), forKey: Self.lastAutoFailureKey) }
                 return done(self.failure(message))
             }
-            UserDefaults.standard.removeObject(forKey: Self.lastAutoFailureKey)
+            UserDefaults.standard.removeObject(forKey: Self.autoPausedUntilKey)
+            UserDefaults.standard.removeObject(forKey: Self.autoFailuresKey)
 
             var cfg = ocb_config()
             guard ocb_get_config(s, &cfg) == 0 else {
@@ -135,6 +142,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         guard byServer else { return }
                         let message = reason ?? (result == -EPERM
                             ? "Your VPN session expired. Connect again to log in."
+                            : result == -EPIPE ? "The server ended the VPN session."
                             : "The VPN session ended.")
                         VPNQuickControl.reloadControl()
                         self.cancelTunnelWithError(self.failure(message))
@@ -156,6 +164,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     // MARK: Helpers
+
+    /// Only an attempt that sent the password (and maybe a Duo push) counts toward the
+    /// long pause. One that couldn't reach the server, say with no signal yet, waits
+    /// briefly so iOS tries again soon after the network is back.
+    private static func pauseAutoConnect(sentCredentials: Bool) {
+        let defaults = UserDefaults.standard
+        var pause = unreachablePause
+        if sentCredentials {
+            let failures = defaults.integer(forKey: autoFailuresKey) + 1
+            defaults.set(failures, forKey: autoFailuresKey)
+            pause = min(autoRetryPause * pow(2, Double(min(failures, 10) - 1)), maxAutoRetryPause)
+        }
+        defaults.set(Date().addingTimeInterval(pause), forKey: autoPausedUntilKey)
+    }
 
     private func finishSession() {
         pathMonitor?.cancel()

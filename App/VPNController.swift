@@ -12,15 +12,29 @@ final class VPNController: ObservableObject {
     @Published var netID: String { didSet { UserDefaults.standard.set(netID, forKey: "netID") } }
     @Published var server: String { didSet { UserDefaults.standard.set(server, forKey: "server") } }
     @Published private(set) var autoNetworks: [String] { didSet { UserDefaults.standard.set(autoNetworks, forKey: "autoNetworks") } }
+    /// Like Cisco's Connect On Demand: after you connect, iOS keeps the VPN up on any
+    /// network and starts it again if it drops.
+    @Published var stayConnected: Bool {
+        didSet {
+            UserDefaults.standard.set(stayConnected, forKey: "stayConnected")
+            applyOnDemandInOrder()
+        }
+    }
     @Published private(set) var hasPassword = SharedKeychain.hasPassword
 
     private var manager: NETunnelProviderManager?
     private var observer: NSObjectProtocol?
+    /// The latest settings change being saved. Connect and Disconnect wait for it, so
+    /// a save that started earlier can't land after theirs and undo it.
+    private var pendingApply: Task<Void, Never>?
+    /// Bump when onDemandRules() changes, so existing installs pick up the new rules.
+    private static let onDemandRulesVersion = 2
 
     private init() {
         netID = UserDefaults.standard.string(forKey: "netID") ?? ""
         server = UserDefaults.standard.string(forKey: "server") ?? AppConfig.defaultServer
         autoNetworks = UserDefaults.standard.stringArray(forKey: "autoNetworks") ?? []
+        stayConnected = UserDefaults.standard.object(forKey: "stayConnected") as? Bool ?? true
     }
 
     var isConnected: Bool { status == .connected }
@@ -31,16 +45,22 @@ final class VPNController: ObservableObject {
         let existing = (try? await NETunnelProviderManager.loadAllFromPreferences())?.first
         manager = existing ?? NETunnelProviderManager()
         observeStatus()
+        if existing != nil, UserDefaults.standard.integer(forKey: "onDemandRulesVersion") < Self.onDemandRulesVersion {
+            UserDefaults.standard.set(Self.onDemandRulesVersion, forKey: "onDemandRulesVersion")
+            applyOnDemandInOrder()
+        }
     }
 
     // MARK: Actions
 
     func connect() async {
         lastError = nil
+        await load()
+        await pendingApply?.value
         guard !netID.trimmingCharacters(in: .whitespaces).isEmpty else { return lastError = "Enter your NetID first." }
         guard hasPassword else { return lastError = "Save your password first." }
         do {
-            let m = try await savedManager(onDemand: !autoNetworks.isEmpty)
+            let m = try await savedManager(onDemand: !onDemandRules().isEmpty)
             try (m.connection as? NETunnelProviderSession)?
                 .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
         } catch {
@@ -48,11 +68,12 @@ final class VPNController: ObservableObject {
         }
     }
 
-    /// Also pauses auto-connect, otherwise iOS would reconnect right away on a
-    /// saved network. The next Connect turns it back on.
+    /// Also pauses auto-connect and Stay Connected, otherwise iOS would reconnect
+    /// right away. The next Connect turns them back on.
     func disconnect() async {
         lastError = nil
         guard let m = manager else { return }
+        await pendingApply?.value
         try? await m.loadFromPreferences() // the Control Center toggle may have changed it
         if m.isOnDemandEnabled {
             m.isOnDemandEnabled = false
@@ -76,12 +97,12 @@ final class VPNController: ObservableObject {
         let name = ssid.trimmingCharacters(in: .whitespaces)
         guard !name.isEmpty, !autoNetworks.contains(name) else { return }
         autoNetworks.append(name)
-        Task { await applyAutoNetworks() }
+        applyOnDemandInOrder()
     }
 
     func removeAutoNetworks(at offsets: IndexSet) {
         autoNetworks.remove(atOffsets: offsets)
-        Task { await applyAutoNetworks() }
+        applyOnDemandInOrder()
     }
 
     /// The Wi-Fi network the phone is on now (needs the VPN configuration to exist).
@@ -112,16 +133,31 @@ final class VPNController: ObservableObject {
         return m
     }
 
-    private func applyAutoNetworks() async {
+    private func applyOnDemandInOrder() {
+        let previous = pendingApply
+        pendingApply = Task {
+            await previous?.value
+            await applyOnDemand()
+        }
+    }
+
+    private func applyOnDemand() async {
         guard let m = manager, m.protocolConfiguration != nil else { return }
         try? await m.loadFromPreferences()
-        m.onDemandRules = onDemandRules()
-        if autoNetworks.isEmpty { m.isOnDemandEnabled = false }
+        let rules = onDemandRules()
+        m.onDemandRules = rules
+        if rules.isEmpty {
+            m.isOnDemandEnabled = false
+        } else if stayConnected, [.connected, .connecting, .reasserting].contains(m.connection.status) {
+            m.isOnDemandEnabled = true // already connected: start keeping it up now
+        }
         try? await m.saveToPreferences()
     }
 
-    /// Connect on saved Wi-Fi networks; leave the VPN alone everywhere else.
+    /// Stay connected: keep the VPN up on every network, Wi-Fi or cellular.
+    /// Otherwise connect on saved Wi-Fi networks and leave the VPN alone elsewhere.
     private func onDemandRules() -> [NEOnDemandRule] {
+        if stayConnected { return [NEOnDemandRuleConnect()] } // matches any interface
         guard !autoNetworks.isEmpty else { return [] }
         let connect = NEOnDemandRuleConnect()
         connect.interfaceTypeMatch = .wiFi

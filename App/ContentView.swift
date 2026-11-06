@@ -63,6 +63,12 @@ struct ContentView: View {
                 }
 
                 Section {
+                    Toggle("Stay Connected", isOn: $vpn.stayConnected)
+                } footer: {
+                    Text("Like Cisco's Connect On Demand. After you connect, iOS starts the VPN again whenever it drops, on any network. If the server has ended your session by then, that means a new Duo push. Disconnecting pauses this until you tap Connect again.")
+                }
+
+                Section {
                     ForEach(vpn.autoNetworks, id: \.self) { Text($0) }
                         .onDelete { vpn.removeAutoNetworks(at: $0) }
                     Button("Add Current Wi-Fi") {
@@ -85,7 +91,9 @@ struct ContentView: View {
                 } header: {
                     Text("Auto-connect")
                 } footer: {
-                    Text("Joining one of these networks connects the VPN. Disconnecting pauses auto-connect until you tap Connect again. Swipe to remove.")
+                    Text(vpn.stayConnected
+                         ? "Not used while Stay Connected is on, which already connects on every network. Swipe to remove."
+                         : "Joining one of these networks connects the VPN. Disconnecting pauses auto-connect until you tap Connect again. Swipe to remove.")
                 }
 
                 Section("Server") {
