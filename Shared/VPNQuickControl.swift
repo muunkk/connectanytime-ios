@@ -27,12 +27,17 @@ enum VPNQuickControl {
         let c = m.connection
         logger.log("Control set \(on ? "on" : "off", privacy: .public); status \(describe(c.status), privacy: .public)")
         defer { reloadControl() }
+        ConnectIntent.set(disconnected: !on)
         if on {
             // iOS disables this configuration whenever another VPN is used. The app's
             // Connect re-enables it on every save; the toggle has to as well.
-            if !m.isEnabled {
+            // Auto-connect stays off while connecting: with it on, iOS can hold other
+            // apps' traffic until the VPN is up, Duo's approval included. It's turned
+            // back on below once the VPN is up, or by the app when it next sees it up.
+            if !m.isEnabled || m.isOnDemandEnabled {
                 m.isEnabled = true
-                try await save(m, "re-enable the VPN")
+                m.isOnDemandEnabled = false
+                try await save(m, "prepare to connect")
             }
             // A start sent while the last session is still shutting down is ignored.
             await wait(c, whileIn: [.disconnecting])
@@ -43,21 +48,17 @@ enum VPNQuickControl {
                 logger.error("Couldn't start the VPN: \(error.localizedDescription, privacy: .public)")
                 throw error
             }
-            // Re-arm auto-connect only after starting, matching the app's Connect button.
-            // Re-arming first can make iOS start an automatic attempt that swallows this
-            // manual one. Best effort: the VPN is already connecting.
-            if !(m.onDemandRules ?? []).isEmpty, !m.isOnDemandEnabled {
-                m.isOnDemandEnabled = true
-                try? await save(m, "re-arm auto-connect")
-            }
             await wait(c, whileIn: [.disconnected, .invalid])
+            // Wait out the Duo approval, then turn Stay Connected on. If iOS ends this
+            // action first, the app does it when it next sees the VPN up.
+            await wait(c, whileIn: [.connecting], upTo: 90)
+            await armIfConnected(m)
         } else {
-            // Pause auto-connect so iOS doesn't reconnect straight away. Best effort:
+            // Pause auto-connect so iOS doesn't reconnect straight away. Saved even if it
+            // reads off, in case the app is turning it on right now. Best effort:
             // stopping matters more.
-            if m.isOnDemandEnabled {
-                m.isOnDemandEnabled = false
-                try? await save(m, "pause auto-connect")
-            }
+            m.isOnDemandEnabled = false
+            try? await save(m, "pause auto-connect")
             c.stopVPNTunnel()
             await wait(c, whileIn: [.connected, .connecting, .reasserting])
         }
@@ -74,10 +75,31 @@ enum VPNQuickControl {
         }
     }
 
-    /// Control Center re-reads the toggle as soon as the action returns. Wait briefly
-    /// for the new state so it doesn't snap back to the old one.
-    private static func wait(_ c: NEVPNConnection, whileIn states: Set<NEVPNStatus>) async {
-        let deadline = Date().addingTimeInterval(2)
+    /// Turns auto-connect (and so Stay Connected) back on once the VPN is up. Never
+    /// while it's connecting: with on-demand on, iOS can hold other apps' traffic until
+    /// the VPN is up, so Duo's approval would wait for the VPN that's waiting for it.
+    /// Never after a Disconnect, from the app or Control Center, until the next connect.
+    static func armIfConnected(_ m: NETunnelProviderManager) async {
+        try? await m.loadFromPreferences()
+        guard m.connection.status == .connected, !m.isOnDemandEnabled,
+              !(m.onDemandRules ?? []).isEmpty, !ConnectIntent.disconnected else { return }
+        m.isOnDemandEnabled = true
+        guard (try? await m.saveToPreferences()) != nil else { return }
+        // The app and Control Center run in different processes. If the other one
+        // disconnected meanwhile, or a new login started, don't leave it on.
+        if ConnectIntent.disconnected || ![.connected, .reasserting].contains(m.connection.status) {
+            logger.log("Disconnected while turning auto-connect on; turning it off again")
+            try? await m.loadFromPreferences()
+            m.isOnDemandEnabled = false
+            try? await m.saveToPreferences()
+        }
+    }
+
+    /// Waits up to `seconds` while the connection is in one of `states`. Control Center
+    /// re-reads the toggle as soon as the action returns, so waiting briefly for the new
+    /// state keeps it from snapping back to the old one.
+    static func wait(_ c: NEVPNConnection, whileIn states: Set<NEVPNStatus>, upTo seconds: TimeInterval = 2) async {
+        let deadline = Date().addingTimeInterval(seconds)
         while states.contains(c.status), Date() < deadline {
             try? await Task.sleep(for: .milliseconds(100))
         }

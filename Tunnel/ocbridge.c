@@ -22,6 +22,7 @@ struct ocb_session {
     void *ctx;
     bool answered_user, answered_password, answered_second;
     char auth_error[512];
+    char *connect_url;
 };
 
 static void reconnected_cb(void *priv);
@@ -183,12 +184,46 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Logged in, but couldn't open the VPN session.");
         return -1;
     }
-    if (openconnect_setup_dtls(s->vpn, 60)) logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
+    // As openconnect's own client does: otherwise every reconnect retries DTLS.
+    if (openconnect_setup_dtls(s->vpn, 60)) {
+        logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
+        openconnect_disable_dtls(s->vpn);
+    }
     return 0;
 }
 
-int ocb_sent_credentials(ocb_session *s) {
-    return s->answered_password || s->answered_second;
+int ocb_resume(ocb_session *s, const char *url, const char *cookie, char *err, size_t errlen) {
+    if (openconnect_parse_url(s->vpn, url) || openconnect_set_cookie(s->vpn, cookie)) {
+        snprintf(err, errlen, "Invalid saved session.");
+        return OCB_SESSION_ENDED;
+    }
+    int ret = openconnect_make_cstp_connection(s->vpn);
+    if (ret) {
+        // The server answers 401 to a session it has ended (EPERM); anything else
+        // is a failure to reach it.
+        snprintf(err, errlen, ret == -EPERM ? "The VPN session has ended."
+                                             : "Couldn't reach the VPN server.");
+        return ret == -EPERM ? OCB_SESSION_ENDED : -1;
+    }
+    // As openconnect's own client does: otherwise every reconnect retries DTLS.
+    if (openconnect_setup_dtls(s->vpn, 60)) {
+        logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
+        openconnect_disable_dtls(s->vpn);
+    }
+    return 0;
+}
+
+const char *ocb_session_url(ocb_session *s) {
+    // openconnect_get_connect_url appends to its buffer on every call; ask once.
+    if (!s->connect_url) {
+        const char *url = openconnect_get_connect_url(s->vpn);
+        s->connect_url = url ? strdup(url) : NULL;
+    }
+    return s->connect_url;
+}
+
+const char *ocb_session_cookie(ocb_session *s) {
+    return openconnect_get_cookie(s->vpn);
 }
 
 static char *dup_or_null(const char *v) { return v && *v ? strdup(v) : NULL; }
@@ -274,6 +309,11 @@ void ocb_cancel(ocb_session *s) {
     if (s && s->cmd_fd >= 0) (void)!write(s->cmd_fd, &cmd, 1);
 }
 
+void ocb_detach(ocb_session *s) {
+    char cmd = OC_CMD_DETACH;
+    if (s && s->cmd_fd >= 0) (void)!write(s->cmd_fd, &cmd, 1);
+}
+
 static void wipe_free(char *p) {
     if (!p) return;
     memset_s(p, strlen(p), 0, strlen(p));
@@ -287,6 +327,7 @@ void ocb_free(ocb_session *s) {
     wipe_free(s->second);
     free(s->user);
     free(s->server);
+    free(s->connect_url);
     free(s);
 }
 

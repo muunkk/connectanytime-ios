@@ -3,6 +3,7 @@ import SwiftUI
 
 struct ContentView: View {
     @EnvironmentObject private var vpn: VPNController
+    @Environment(\.scenePhase) private var scenePhase
     @State private var password = ""
     @State private var newNetwork = ""
     @FocusState private var focused: Bool
@@ -65,7 +66,7 @@ struct ContentView: View {
                 Section {
                     Toggle("Stay Connected", isOn: $vpn.stayConnected)
                 } footer: {
-                    Text("Like Cisco's Connect On Demand. After you connect, iOS starts the VPN again whenever it drops, on any network. If the server has ended your session by then, that means a new Duo push. Disconnecting pauses this until you tap Connect again.")
+                    Text("Like Cisco's AnyConnect. After you connect, the VPN keeps your session through network changes and comes back whenever it drops, on any network, without Duo. Once the server ends the session, it waits for you to tap Connect. Disconnecting pauses this until you tap Connect again.")
                 }
 
                 Section {
@@ -93,7 +94,7 @@ struct ContentView: View {
                 } footer: {
                     Text(vpn.stayConnected
                          ? "Not used while Stay Connected is on, which already connects on every network. Swipe to remove."
-                         : "Joining one of these networks connects the VPN. Disconnecting pauses auto-connect until you tap Connect again. Swipe to remove.")
+                         : "Joining one of these networks brings the VPN back if your session is still open. A new login, and its Duo push, only happens when you tap Connect. Disconnecting pauses auto-connect until you tap Connect again. Swipe to remove.")
                 }
 
                 Section("Server") {
@@ -107,6 +108,9 @@ struct ContentView: View {
             .navigationTitle("ConnectAnytime")
         }
         .task { await vpn.load() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { vpn.refresh() } // e.g. back from approving in Duo
+        }
     }
 
     private var symbol: String {
