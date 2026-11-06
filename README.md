@@ -19,7 +19,7 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
   Connected on). If an automatic attempt fails after sending your password (say you
   ignored Duo), it waits 15 minutes before trying again, then twice as long after each
   further failure, up to 4 hours, instead of sending more pushes. If it couldn't reach
-  the server at all, say with no signal yet, it tries again a minute later.
+  the server at all, say with no signal yet, it can try again after a minute.
   Disconnecting pauses auto-connect until you connect again.
 - **Survives network changes.** Switch Wi-Fi, drop to cellular or lose signal for a while,
   and the VPN reconnects with the session it already has, like Cisco's client. No new
