@@ -8,6 +8,10 @@
 typedef struct ocb_session ocb_session;
 typedef void (*ocb_log_fn)(void *ctx, int level, const char *line);
 
+/// Whether the last ocb_connect sent the password (and so possibly a Duo push).
+/// A failure before that, such as no network, is safe to retry right away.
+int ocb_sent_credentials(ocb_session *s);
+
 /// Tunnel settings pushed by the server. Strings are owned by the struct.
 typedef struct {
     char *addr, *netmask;     // IPv4

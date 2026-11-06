@@ -12,8 +12,14 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
 
 - **Connect / Disconnect** in the app, from a **Control Center** toggle (filled when
   connected), or with Siri, Shortcuts and the Action button.
-- **Auto-connect** when you join Wi-Fi networks you choose. If an automatic attempt fails
-  (say you ignored Duo), it pauses for 15 minutes instead of sending more pushes.
+- **Stay Connected** (on by default), like Cisco's Connect On Demand. After you connect,
+  iOS starts the VPN again whenever it drops, on any network. If the server has ended
+  the session by then, that means a new Duo push.
+- **Auto-connect** when you join Wi-Fi networks you choose (not needed with Stay
+  Connected on). If an automatic attempt fails after sending your password (say you
+  ignored Duo), it waits 15 minutes before trying again, then twice as long after each
+  further failure, up to 4 hours, instead of sending more pushes. If it couldn't reach
+  the server at all, say with no signal yet, it can try again after a minute.
   Disconnecting pauses auto-connect until you connect again.
 - **Survives network changes.** Switch Wi-Fi, drop to cellular or lose signal for a while,
   and the VPN reconnects with the session it already has, like Cisco's client. No new

@@ -187,6 +187,10 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
     return 0;
 }
 
+int ocb_sent_credentials(ocb_session *s) {
+    return s->answered_password || s->answered_second;
+}
+
 static char *dup_or_null(const char *v) { return v && *v ? strdup(v) : NULL; }
 
 static char *join_routes(struct oc_split_include *list) {
