@@ -24,8 +24,8 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
   by itself: a new login, and its Duo push, only happens when you connect. It couldn't
   work anyway, since iOS holds Duo's approval while it's starting the VPN
   automatically. Disconnecting pauses auto-connect until you connect again.
-- **Survives network changes.** Switch Wi-Fi, go between cellular and Wi-Fi or lose
-  signal for a while, and the VPN reconnects with the session it already has, like Cisco's client. No new
+- **Survives network changes.** Switch Wi-Fi, drop to cellular or lose signal for a while,
+  and the VPN reconnects with the session it already has, like Cisco's client. No new
   login, no new Duo push, as long as the server still holds the session. It usually
   reconnects within seconds, and keeps trying for up to 30 minutes; meanwhile traffic
   waits rather than bypassing the VPN. If the server gives the phone a new VPN address
