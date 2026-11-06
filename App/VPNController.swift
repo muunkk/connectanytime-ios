@@ -81,12 +81,13 @@ final class VPNController: ObservableObject {
                 let m = try await self.savedManager() // saves on-demand off
                 // iOS may have an automatic attempt under way (it can only rejoin); a start
                 // sent while one is running or stopping is ignored.
-                switch await VPNQuickControl.settle(m.connection) {
+                let settled = await VPNQuickControl.settle(m.connection)
+                guard !ConnectIntent.disconnected else { return } // Disconnect tapped meanwhile
+                switch settled {
                 case .connected, .reasserting: return
                 case .disconnected, .invalid: break
                 default: return self.lastError = "The last attempt is still stopping. Tap Connect again in a moment."
                 }
-                guard !ConnectIntent.disconnected else { return } // Disconnect tapped meanwhile
                 // Auto-connect stays off until the VPN is up (see armOnDemandIfConnected).
                 try (m.connection as? NETunnelProviderSession)?
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
