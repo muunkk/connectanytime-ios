@@ -188,7 +188,8 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Logged in, but couldn't open the VPN session.");
         return -1;
     }
-    // Reconnects look the name up again (see Vendor/patches); keep them on this server.
+    // From now on, connections look the name up again (see Vendor/patches) and keep
+    // to this server.
     pin_server(s, openconnect_get_dnsname(s->vpn), openconnect_get_hostname(s->vpn));
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
