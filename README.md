@@ -12,15 +12,18 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
 
 - **Connect / Disconnect** in the app, from a **Control Center** toggle (filled when
   connected), or with Siri, Shortcuts and the Action button.
-- **Stay Connected** (on by default), like Cisco's Connect On Demand. After you connect,
-  iOS starts the VPN again whenever it drops, on any network. If the server has ended
-  the session by then, that means a new Duo push.
+- **Stay Connected** (on by default), like Cisco's AnyConnect. After you connect, iOS
+  starts the VPN again whenever it drops, on any network, and it rejoins the session
+  you already have: no new login, no Duo. Once the server has ended the session, it
+  waits for you to tap Connect instead of sending Duo pushes on its own. It switches on
+  once the VPN is up, not while you're approving Duo, so the approval isn't held up.
+  Turning the VPN on in iOS Settings counts as automatic too, so it only rejoins an open
+  session; to log in, use the app, Control Center, Siri or Shortcuts.
 - **Auto-connect** when you join Wi-Fi networks you choose (not needed with Stay
-  Connected on). If an automatic attempt fails after sending your password (say you
-  ignored Duo), it waits 15 minutes before trying again, then twice as long after each
-  further failure, up to 4 hours, instead of sending more pushes. If it couldn't reach
-  the server at all, say with no signal yet, it can try again after a minute.
-  Disconnecting pauses auto-connect until you connect again.
+  Connected on), if your session is still open. Like Stay Connected, it never logs in
+  by itself: a new login, and its Duo push, only happens when you connect. It couldn't
+  work anyway, since iOS holds Duo's approval while it's starting the VPN
+  automatically. Disconnecting pauses auto-connect until you connect again.
 - **Survives network changes.** Switch Wi-Fi, drop to cellular or lose signal for a while,
   and the VPN reconnects with the session it already has, like Cisco's client. No new
   login, no new Duo push, as long as the server still holds the session. It usually
@@ -43,6 +46,9 @@ traffic through the tunnel.
 - Sent only to the VPN server, over TLS, after the server's certificate is verified.
 - Never logged. The extension logs OpenConnect's status lines only, and debug output (which
   would include form data) is turned off.
+- To rejoin the VPN session without Duo, the extension keeps the server's session
+  cookie in the Keychain, on this iPhone only. It's never logged, and it's deleted when
+  you disconnect or the server ends the session.
 - Each login field is answered once. A wrong password fails instead of retrying, so it
   can't lock your account.
 - Siri, Shortcuts and Control Center actions need Face ID or your passcode when the phone

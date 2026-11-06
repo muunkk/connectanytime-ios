@@ -15,14 +15,40 @@ enum AppConfig {
 /// The NetID password, shared between the app and the tunnel extension.
 /// Readable after first unlock so auto-connect works with the phone locked.
 enum SharedKeychain {
+    static func read() -> String? { KeychainItem.read("nyu") }
+    @discardableResult
+    static func save(_ password: String) -> Bool { KeychainItem.save(password, as: "nyu") }
+    static var hasPassword: Bool { read() != nil }
+}
+
+/// Whether you last turned the VPN off, from the app or Control Center. Until you
+/// connect again, nothing turns auto-connect back on. Shared so the app can't undo a
+/// Control Center Disconnect (or the reverse); in the Keychain because there's no
+/// shared app group.
+enum ConnectIntent {
+    static var disconnected: Bool { KeychainItem.read("disconnected") != nil }
+    static func set(disconnected: Bool) {
+        guard disconnected != self.disconnected else { return }
+        if disconnected { KeychainItem.save("1", as: "disconnected") } else { KeychainItem.delete("disconnected") }
+    }
+}
+
+/// The VPN session the tunnel can rejoin without logging in (written by the tunnel).
+enum SavedSessionItem {
+    static let account = "session"
+    static var exists: Bool { KeychainItem.read(account) != nil }
+}
+
+/// Generic-password items in the Keychain group the app and its extensions share.
+/// Readable after first unlock so auto-connect works with the phone locked.
+enum KeychainItem {
     private static let service = "connectanytime"
-    private static let account = "nyu"
 
     private static var accessGroup: String {
         Bundle.main.object(forInfoDictionaryKey: "KeychainGroup") as? String ?? ""
     }
 
-    private static var base: [String: Any] {
+    private static func base(_ account: String) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -31,8 +57,8 @@ enum SharedKeychain {
         ]
     }
 
-    static func read() -> String? {
-        var q = base
+    static func read(_ account: String) -> String? {
+        var q = base(account)
         q[kSecReturnData as String] = true
         var out: AnyObject?
         guard SecItemCopyMatching(q as CFDictionary, &out) == errSecSuccess, let d = out as? Data else { return nil }
@@ -40,13 +66,15 @@ enum SharedKeychain {
     }
 
     @discardableResult
-    static func save(_ password: String) -> Bool {
-        SecItemDelete(base as CFDictionary)
-        var add = base
-        add[kSecValueData as String] = Data(password.utf8)
+    static func save(_ value: String, as account: String) -> Bool {
+        delete(account)
+        var add = base(account)
+        add[kSecValueData as String] = Data(value.utf8)
         add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 
-    static var hasPassword: Bool { read() != nil }
+    static func delete(_ account: String) {
+        SecItemDelete(base(account) as CFDictionary)
+    }
 }

@@ -3,11 +3,13 @@
 #include <openconnect.h>
 #include <Security/Security.h>
 #include <errno.h>
+#include <netdb.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -22,6 +24,8 @@ struct ocb_session {
     void *ctx;
     bool answered_user, answered_password, answered_second;
     char auth_error[512];
+    char *connect_url;
+    char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
 };
 
 static void reconnected_cb(void *priv);
@@ -183,12 +187,82 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Logged in, but couldn't open the VPN session.");
         return -1;
     }
-    if (openconnect_setup_dtls(s->vpn, 60)) logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
+    // As openconnect's own client does: otherwise every reconnect retries DTLS.
+    if (openconnect_setup_dtls(s->vpn, 60)) {
+        logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
+        openconnect_disable_dtls(s->vpn);
+    }
     return 0;
 }
 
-int ocb_sent_credentials(ocb_session *s) {
-    return s->answered_password || s->answered_second;
+// Like openconnect's --resolve: send the server's name to the address the session
+// was made on, so a round-robin DNS answer can't hand the cookie to another server.
+// The normal answers follow, in case the pinned address can't be reached from this
+// network (the list is tried in order, as openconnect's own --resolve merges them).
+static int pinned_getaddrinfo(void *priv, const char *node, const char *service,
+                              const struct addrinfo *hints, struct addrinfo **res) {
+    struct ocb_session *s = priv;
+    if (!node || !s->pin_name || !s->pin_ip || strcasecmp(node, s->pin_name))
+        return getaddrinfo(node, service, hints, res);
+    struct addrinfo *pinned = NULL, *normal = NULL;
+    int pinned_err = getaddrinfo(s->pin_ip, service, hints, &pinned);
+    int normal_err = getaddrinfo(node, service, hints, &normal);
+    if (pinned_err) { *res = normal; return normal_err; }
+    struct addrinfo *tail = pinned;
+    while (tail->ai_next) tail = tail->ai_next;
+    tail->ai_next = normal_err ? NULL : normal;
+    *res = pinned;
+    return 0;
+}
+
+int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *dnsname,
+               const char *ip, char *err, size_t errlen) {
+    if (openconnect_parse_url(s->vpn, url) || openconnect_set_cookie(s->vpn, cookie)) {
+        snprintf(err, errlen, "Invalid saved session.");
+        return OCB_SESSION_ENDED;
+    }
+    if (dnsname && *dnsname && ip && *ip) {
+        size_t n = strlen(ip);
+        bool bracketed = n > 2 && ip[0] == '[' && ip[n - 1] == ']'; // IPv6 as in a URL
+        s->pin_name = strdup(dnsname);
+        s->pin_ip = bracketed ? strndup(ip + 1, n - 2) : strdup(ip);
+        openconnect_override_getaddrinfo(s->vpn, pinned_getaddrinfo);
+    }
+    int ret = openconnect_make_cstp_connection(s->vpn);
+    if (ret) {
+        // The server answers 401 to a session it has ended (EPERM); anything else
+        // is a failure to reach it.
+        snprintf(err, errlen, ret == -EPERM ? "The VPN session has ended."
+                                             : "Couldn't reach the VPN server.");
+        return ret == -EPERM ? OCB_SESSION_ENDED : -1;
+    }
+    // As openconnect's own client does: otherwise every reconnect retries DTLS.
+    if (openconnect_setup_dtls(s->vpn, 60)) {
+        logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
+        openconnect_disable_dtls(s->vpn);
+    }
+    return 0;
+}
+
+const char *ocb_session_url(ocb_session *s) {
+    // openconnect_get_connect_url appends to its buffer on every call; ask once.
+    if (!s->connect_url) {
+        const char *url = openconnect_get_connect_url(s->vpn);
+        s->connect_url = url ? strdup(url) : NULL;
+    }
+    return s->connect_url;
+}
+
+const char *ocb_session_cookie(ocb_session *s) {
+    return openconnect_get_cookie(s->vpn);
+}
+
+const char *ocb_session_dnsname(ocb_session *s) {
+    return openconnect_get_dnsname(s->vpn);
+}
+
+const char *ocb_session_ip(ocb_session *s) {
+    return openconnect_get_hostname(s->vpn); // the address connected to, despite the name
 }
 
 static char *dup_or_null(const char *v) { return v && *v ? strdup(v) : NULL; }
@@ -274,6 +348,11 @@ void ocb_cancel(ocb_session *s) {
     if (s && s->cmd_fd >= 0) (void)!write(s->cmd_fd, &cmd, 1);
 }
 
+void ocb_detach(ocb_session *s) {
+    char cmd = OC_CMD_DETACH;
+    if (s && s->cmd_fd >= 0) (void)!write(s->cmd_fd, &cmd, 1);
+}
+
 static void wipe_free(char *p) {
     if (!p) return;
     memset_s(p, strlen(p), 0, strlen(p));
@@ -287,6 +366,9 @@ void ocb_free(ocb_session *s) {
     wipe_free(s->second);
     free(s->user);
     free(s->server);
+    free(s->connect_url);
+    free(s->pin_name);
+    free(s->pin_ip);
     free(s);
 }
 

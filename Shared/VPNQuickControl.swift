@@ -16,10 +16,19 @@ enum VPNQuickControl {
         try? await NETunnelProviderManager.loadAllFromPreferences().first
     }
 
-    /// On while connected or on the way there (e.g. waiting for Duo).
+    /// On while connected or on the way there (e.g. waiting for Duo). Not for an
+    /// automatic attempt with no session to rejoin, which can only fail, so a tap
+    /// takes over and logs in instead of turning it off.
     static func isOn() async -> Bool {
         guard let m = await manager() else { return false }
+        if isHopelessAutoAttempt(m) { return false }
         return [.connected, .connecting, .reasserting].contains(m.connection.status)
+    }
+
+    /// iOS's automatic attempt (manual logins save on-demand off first) with no saved
+    /// session: it can only fail with "tap Connect to log in".
+    static func isHopelessAutoAttempt(_ m: NETunnelProviderManager) -> Bool {
+        m.connection.status == .connecting && m.isOnDemandEnabled && !SavedSessionItem.exists
     }
 
     static func set(_ on: Bool) async throws {
@@ -27,15 +36,31 @@ enum VPNQuickControl {
         let c = m.connection
         logger.log("Control set \(on ? "on" : "off", privacy: .public); status \(describe(c.status), privacy: .public)")
         defer { reloadControl() }
+        ConnectIntent.set(disconnected: !on)
         if on {
+            // Our own login is already waiting for Duo (on-demand is off for those):
+            // leave it be, or stopping it would mean a second push.
+            if c.status == .connecting, !m.isOnDemandEnabled {
+                await wait(c, whileIn: [.connecting], upTo: 90)
+                return await armIfConnected(m)
+            }
             // iOS disables this configuration whenever another VPN is used. The app's
             // Connect re-enables it on every save; the toggle has to as well.
-            if !m.isEnabled {
+            // Auto-connect stays off while connecting: with it on, iOS can hold other
+            // apps' traffic until the VPN is up, Duo's approval included. It's turned
+            // back on below once the VPN is up, or by the app when it next sees it up.
+            if !m.isEnabled || m.isOnDemandEnabled {
                 m.isEnabled = true
-                try await save(m, "re-enable the VPN")
+                m.isOnDemandEnabled = false
+                try await save(m, "prepare to connect")
             }
-            // A start sent while the last session is still shutting down is ignored.
-            await wait(c, whileIn: [.disconnecting])
+            // A start sent while another attempt is running or stopping is ignored.
+            switch await settle(c) {
+            case .connected, .reasserting: return await armIfConnected(m)
+            case .disconnected, .invalid: break
+            default: return logger.error("The last attempt is still stopping; not starting")
+            }
+            guard !ConnectIntent.disconnected else { return } // turned off meanwhile
             do {
                 try (c as? NETunnelProviderSession)?
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
@@ -43,21 +68,17 @@ enum VPNQuickControl {
                 logger.error("Couldn't start the VPN: \(error.localizedDescription, privacy: .public)")
                 throw error
             }
-            // Re-arm auto-connect only after starting, matching the app's Connect button.
-            // Re-arming first can make iOS start an automatic attempt that swallows this
-            // manual one. Best effort: the VPN is already connecting.
-            if !(m.onDemandRules ?? []).isEmpty, !m.isOnDemandEnabled {
-                m.isOnDemandEnabled = true
-                try? await save(m, "re-arm auto-connect")
-            }
             await wait(c, whileIn: [.disconnected, .invalid])
+            // Wait out the Duo approval, then turn Stay Connected on. If iOS ends this
+            // action first, the app does it when it next sees the VPN up.
+            await wait(c, whileIn: [.connecting], upTo: 90)
+            await armIfConnected(m)
         } else {
-            // Pause auto-connect so iOS doesn't reconnect straight away. Best effort:
+            // Pause auto-connect so iOS doesn't reconnect straight away. Saved even if it
+            // reads off, in case the app is turning it on right now. Best effort:
             // stopping matters more.
-            if m.isOnDemandEnabled {
-                m.isOnDemandEnabled = false
-                try? await save(m, "pause auto-connect")
-            }
+            m.isOnDemandEnabled = false
+            try? await save(m, "pause auto-connect")
             c.stopVPNTunnel()
             await wait(c, whileIn: [.connected, .connecting, .reasserting])
         }
@@ -74,12 +95,49 @@ enum VPNQuickControl {
         }
     }
 
-    /// Control Center re-reads the toggle as soon as the action returns. Wait briefly
-    /// for the new state so it doesn't snap back to the old one.
-    private static func wait(_ c: NEVPNConnection, whileIn states: Set<NEVPNStatus>) async {
-        let deadline = Date().addingTimeInterval(2)
-        while states.contains(c.status), Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(100))
+    /// Turns auto-connect (and so Stay Connected) back on once the VPN is up. Never
+    /// while it's connecting: with on-demand on, iOS can hold other apps' traffic until
+    /// the VPN is up, so Duo's approval would wait for the VPN that's waiting for it.
+    /// Never after a Disconnect, from the app or Control Center, until the next connect.
+    static func armIfConnected(_ m: NETunnelProviderManager) async {
+        try? await m.loadFromPreferences()
+        guard m.connection.status == .connected, !m.isOnDemandEnabled,
+              !(m.onDemandRules ?? []).isEmpty, !ConnectIntent.disconnected else { return }
+        m.isOnDemandEnabled = true
+        guard (try? await m.saveToPreferences()) != nil else { return }
+        // The app and Control Center run in different processes. If the other one
+        // disconnected meanwhile, or a new login started, don't leave it on. (Rolling
+        // back saves the configuration, so a login started in the same instant could
+        // see one save mid-connect; that takes a tap within a moment of this one.)
+        if ConnectIntent.disconnected || ![.connected, .reasserting].contains(m.connection.status) {
+            logger.log("Disconnected while turning auto-connect on; turning it off again")
+            try? await m.loadFromPreferences()
+            m.isOnDemandEnabled = false
+            try? await m.saveToPreferences()
+        }
+    }
+
+    /// Lets an attempt already under way (iOS's automatic one) finish, for up to 10 s,
+    /// then stops it. Call with on-demand saved off, so iOS doesn't start another, and
+    /// never during a login of our own. Returns the status it ends in.
+    /// Returns early after a Disconnect, which then does the stopping.
+    static func settle(_ c: NEVPNConnection) async -> NEVPNStatus {
+        await wait(c, whileIn: [.connecting], upTo: 10, untilDisconnected: true)
+        if ConnectIntent.disconnected { return c.status }
+        if c.status == .connecting { c.stopVPNTunnel() }
+        await wait(c, whileIn: [.connecting, .disconnecting], upTo: 5)
+        return c.status
+    }
+
+    /// Waits up to `seconds` while the connection is in one of `states`. Control Center
+    /// re-reads the toggle as soon as the action returns, so waiting briefly for the new
+    /// state keeps it from snapping back to the old one.
+    /// `untilDisconnected`: also stop waiting once you've turned the VPN off.
+    static func wait(_ c: NEVPNConnection, whileIn states: Set<NEVPNStatus>, upTo seconds: TimeInterval = 2,
+                     untilDisconnected: Bool = false) async {
+        let deadline = Date().addingTimeInterval(seconds)
+        while states.contains(c.status), Date() < deadline, !(untilDisconnected && ConnectIntent.disconnected) {
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return } // cancelled
         }
     }
 

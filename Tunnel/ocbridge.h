@@ -8,10 +8,6 @@
 typedef struct ocb_session ocb_session;
 typedef void (*ocb_log_fn)(void *ctx, int level, const char *line);
 
-/// Whether the last ocb_connect sent the password (and so possibly a Duo push).
-/// A failure before that, such as no network, is safe to retry right away.
-int ocb_sent_credentials(ocb_session *s);
-
 /// Tunnel settings pushed by the server. Strings are owned by the struct.
 typedef struct {
     char *addr, *netmask;     // IPv4
@@ -41,6 +37,22 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
 /// VPN session. Blocks until Duo is approved or rejected. 0 on success.
 int ocb_connect(ocb_session *s, char *err, size_t errlen);
 
+/// Rejoins the session from an earlier login instead of logging in: no password,
+/// no Duo. The arguments come from the ocb_session_* getters below; `dnsname` and
+/// `ip` (may be NULL) pin the server's name to the address the session was made
+/// on. 0 on success, OCB_SESSION_ENDED if the server no longer accepts the session,
+/// any other negative value on other failures (e.g. no network).
+#define OCB_SESSION_ENDED (-2)
+int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *dnsname,
+               const char *ip, char *err, size_t errlen);
+
+/// After ocb_connect or ocb_resume succeeds: what ocb_resume needs to rejoin the
+/// session later. Owned by the session. The cookie is a credential; never log it.
+const char *ocb_session_url(ocb_session *s);
+const char *ocb_session_cookie(ocb_session *s);
+const char *ocb_session_dnsname(ocb_session *s);
+const char *ocb_session_ip(ocb_session *s);
+
 int ocb_get_config(ocb_session *s, ocb_config *out);
 void ocb_config_free(ocb_config *c);
 
@@ -54,8 +66,12 @@ int ocb_run(ocb_session *s, int tun_fd, int reconnect_timeout);
 /// the existing session, e.g. after switching networks.
 void ocb_reconnect(ocb_session *s);
 
-/// Thread-safe: aborts ocb_connect or ocb_run.
+/// Thread-safe: aborts ocb_connect or ocb_run, logging out of the server's session.
 void ocb_cancel(ocb_session *s);
+
+/// Thread-safe: like ocb_cancel, but leaves the server's session open, so
+/// ocb_resume can rejoin it.
+void ocb_detach(ocb_session *s);
 
 void ocb_free(ocb_session *s);
 
