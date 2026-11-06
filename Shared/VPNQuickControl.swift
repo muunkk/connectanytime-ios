@@ -86,7 +86,9 @@ enum VPNQuickControl {
         m.isOnDemandEnabled = true
         guard (try? await m.saveToPreferences()) != nil else { return }
         // The app and Control Center run in different processes. If the other one
-        // disconnected meanwhile, or a new login started, don't leave it on.
+        // disconnected meanwhile, or a new login started, don't leave it on. (Rolling
+        // back saves the configuration, so a login started in the same instant could
+        // see one save mid-connect; that takes a tap within a moment of this one.)
         if ConnectIntent.disconnected || ![.connected, .reasserting].contains(m.connection.status) {
             logger.log("Disconnected while turning auto-connect on; turning it off again")
             try? await m.loadFromPreferences()
@@ -101,7 +103,7 @@ enum VPNQuickControl {
     static func wait(_ c: NEVPNConnection, whileIn states: Set<NEVPNStatus>, upTo seconds: TimeInterval = 2) async {
         let deadline = Date().addingTimeInterval(seconds)
         while states.contains(c.status), Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(100))
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return } // cancelled
         }
     }
 

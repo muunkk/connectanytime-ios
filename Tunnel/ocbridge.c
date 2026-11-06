@@ -3,11 +3,13 @@
 #include <openconnect.h>
 #include <Security/Security.h>
 #include <errno.h>
+#include <netdb.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -23,6 +25,7 @@ struct ocb_session {
     bool answered_user, answered_password, answered_second;
     char auth_error[512];
     char *connect_url;
+    char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
 };
 
 static void reconnected_cb(void *priv);
@@ -192,10 +195,27 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
     return 0;
 }
 
-int ocb_resume(ocb_session *s, const char *url, const char *cookie, char *err, size_t errlen) {
+// Like openconnect's --resolve: send the server's name to the address the session
+// was made on, so a round-robin DNS answer can't hand the cookie to another server.
+static int pinned_getaddrinfo(void *priv, const char *node, const char *service,
+                              const struct addrinfo *hints, struct addrinfo **res) {
+    struct ocb_session *s = priv;
+    if (node && s->pin_name && s->pin_ip && !strcasecmp(node, s->pin_name)) node = s->pin_ip;
+    return getaddrinfo(node, service, hints, res);
+}
+
+int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *dnsname,
+               const char *ip, char *err, size_t errlen) {
     if (openconnect_parse_url(s->vpn, url) || openconnect_set_cookie(s->vpn, cookie)) {
         snprintf(err, errlen, "Invalid saved session.");
         return OCB_SESSION_ENDED;
+    }
+    if (dnsname && *dnsname && ip && *ip) {
+        size_t n = strlen(ip);
+        bool bracketed = n > 2 && ip[0] == '[' && ip[n - 1] == ']'; // IPv6 as in a URL
+        s->pin_name = strdup(dnsname);
+        s->pin_ip = bracketed ? strndup(ip + 1, n - 2) : strdup(ip);
+        openconnect_override_getaddrinfo(s->vpn, pinned_getaddrinfo);
     }
     int ret = openconnect_make_cstp_connection(s->vpn);
     if (ret) {
@@ -224,6 +244,14 @@ const char *ocb_session_url(ocb_session *s) {
 
 const char *ocb_session_cookie(ocb_session *s) {
     return openconnect_get_cookie(s->vpn);
+}
+
+const char *ocb_session_dnsname(ocb_session *s) {
+    return openconnect_get_dnsname(s->vpn);
+}
+
+const char *ocb_session_ip(ocb_session *s) {
+    return openconnect_get_hostname(s->vpn); // the address connected to, despite the name
 }
 
 static char *dup_or_null(const char *v) { return v && *v ? strdup(v) : NULL; }
@@ -328,6 +356,8 @@ void ocb_free(ocb_session *s) {
     free(s->user);
     free(s->server);
     free(s->connect_url);
+    free(s->pin_name);
+    free(s->pin_ip);
     free(s);
 }
 

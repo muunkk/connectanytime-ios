@@ -38,16 +38,20 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
 int ocb_connect(ocb_session *s, char *err, size_t errlen);
 
 /// Rejoins the session from an earlier login instead of logging in: no password,
-/// no Duo. `url` and `cookie` come from ocb_session_url/ocb_session_cookie. 0 on
-/// success, OCB_SESSION_ENDED if the server no longer accepts the session, any
-/// other negative value on other failures (e.g. no network).
+/// no Duo. The arguments come from the ocb_session_* getters below; `dnsname` and
+/// `ip` (may be NULL) pin the server's name to the address the session was made
+/// on. 0 on success, OCB_SESSION_ENDED if the server no longer accepts the session,
+/// any other negative value on other failures (e.g. no network).
 #define OCB_SESSION_ENDED (-2)
-int ocb_resume(ocb_session *s, const char *url, const char *cookie, char *err, size_t errlen);
+int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *dnsname,
+               const char *ip, char *err, size_t errlen);
 
 /// After ocb_connect or ocb_resume succeeds: what ocb_resume needs to rejoin the
 /// session later. Owned by the session. The cookie is a credential; never log it.
 const char *ocb_session_url(ocb_session *s);
 const char *ocb_session_cookie(ocb_session *s);
+const char *ocb_session_dnsname(ocb_session *s);
+const char *ocb_session_ip(ocb_session *s);
 
 int ocb_get_config(ocb_session *s, ocb_config *out);
 void ocb_config_free(ocb_config *c);

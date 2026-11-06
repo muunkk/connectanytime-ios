@@ -36,6 +36,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var server = ""
     /// Why the session ended, when it's our doing rather than OpenConnect's.
     private var endReason: String?
+    /// We ended it without logging out, so the saved session stays for a rejoin.
+    private var keepSessionOnEnd = false
 
     /// How long to keep retrying a dropped connection with the existing session
     /// (no Duo) before giving up, e.g. while walking between Wi-Fi networks.
@@ -72,7 +74,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 guard let s = self.newSession(server: server, user: user, password: "") else {
                     return done(self.failure(self.stopping ? "Cancelled." : "Couldn't start the VPN client."))
                 }
-                let result = ocb_resume(s, saved.url, saved.cookie, &err, err.count)
+                let result = ocb_resume(s, saved.url, saved.cookie, saved.dnsName, saved.ip, &err, err.count)
                 if result == 0 {
                     session = s
                 } else {
@@ -110,7 +112,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             UserDefaults.standard.removeObject(forKey: "autoFailures")
             if let url = ocb_session_url(s), let cookie = ocb_session_cookie(s) {
                 SessionStore.save(.init(server: server, user: user,
-                                        url: String(cString: url), cookie: String(cString: cookie)))
+                                        url: String(cString: url), cookie: String(cString: cookie),
+                                        dnsName: ocb_session_dnsname(s).map { String(cString: $0) },
+                                        ip: ocb_session_ip(s).map { String(cString: $0) }))
             }
             // Stopped just as the login finished: don't bring the tunnel up, and don't keep
             // a session you just disconnected.
@@ -149,11 +153,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     self.queue.async {
                         let byServer = !self.stopping
                         let reason = self.endReason
+                        let keepSession = self.keepSessionOnEnd
                         self.finishSession()
                         guard byServer else { return }
-                        // Ended by the server, or by us (endReason) with a logout. Otherwise,
-                        // e.g. no network for too long, the next start can still try to rejoin.
-                        if reason != nil || result == -EPERM || result == -EPIPE { SessionStore.clear() }
+                        // Ended by the server, or by us with a logout. Otherwise, e.g. no
+                        // network for too long, the next start tries to rejoin and the server
+                        // decides.
+                        if (reason != nil && !keepSession) || result == -EPERM || result == -EPIPE {
+                            SessionStore.clear()
+                        }
                         let message = reason ?? (result == -EPERM
                             ? "Your VPN session expired. Connect again to log in."
                             : result == -EPIPE ? "The server ended the VPN session."
@@ -249,6 +257,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         pendingReconnect?.cancel()
         pendingReconnect = nil
         endReason = nil
+        keepSessionOnEnd = false
         installedKey = nil
         wanted = nil
         applyingSettings = false
@@ -377,8 +386,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let s = session, let deadline = reconnectDeadline else { return }
         if Date() >= deadline {
             endReason = "Couldn't reconnect in \(Self.resumeWindow / 60) minutes. Connect again to log in."
-            log("Couldn't reconnect in \(Self.resumeWindow / 60) minutes; ending the session")
-            ocb_cancel(s)
+            log("Couldn't reconnect in \(Self.resumeWindow / 60) minutes; stopping")
+            // Without logging out: if the server still has the session when there's a
+            // network again, the next start rejoins it without Duo.
+            keepSessionOnEnd = true
+            ocb_detach(s)
         } else if Date().timeIntervalSince(lastReconnectKick) >= 60 {
             kickReconnect()
         }
@@ -390,6 +402,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// server ends the session.
     private struct SavedSession: Codable {
         let server, user, url, cookie: String
+        let dnsName, ip: String? // the server's name and the address the session is on
     }
 
     private enum SessionStore {
