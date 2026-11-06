@@ -26,7 +26,30 @@
  
  		memset(&hints, 0, sizeof(struct addrinfo));
  		hints.ai_family = AF_UNSPEC;
-@@ -528,13 +530,8 @@
+@@ -427,6 +429,22 @@
+ 		if (hints.ai_flags & AI_NUMERICHOST)
+ 			free(hostname);
+ 
++		/* Stay on the same server when this network can reach it: if the
++		 * lookup returned the cached address, try it first. */
++		if (vpninfo->peer_addr) {
++			struct addrinfo **pp;
++			for (pp = &result; *pp; pp = &(*pp)->ai_next) {
++				if ((*pp)->ai_addrlen == vpninfo->peer_addrlen &&
++				    match_sockaddr(vpninfo->peer_addr, (*pp)->ai_addr)) {
++					struct addrinfo *hit = *pp;
++					*pp = hit->ai_next;
++					hit->ai_next = result;
++					result = hit;
++					break;
++				}
++			}
++		}
++
+ 		for (rp = result; rp ; rp = rp->ai_next) {
+ 			char host[80];
+ 
+@@ -528,13 +546,8 @@
  			 * don't bother falling back to it if it didn't work. */
  			if (vpninfo->peer_addr && vpninfo->peer_addrlen == rp->ai_addrlen &&
  			    match_sockaddr(vpninfo->peer_addr, rp->ai_addr)) {
@@ -42,7 +65,7 @@
  			}
  		}
  		freeaddrinfo(result);
-@@ -544,7 +541,7 @@
+@@ -544,7 +557,7 @@
  				     _("Failed to connect to host %s\n"),
  				     vpninfo->proxy?:vpninfo->hostname);
  			ssl_sock = -EINVAL;
