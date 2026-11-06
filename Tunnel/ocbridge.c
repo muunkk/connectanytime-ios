@@ -199,6 +199,8 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
 // was made on, so a round-robin DNS answer can't hand the cookie to another server.
 // The normal answers follow, in case the pinned address can't be reached from this
 // network (the list is tried in order, as openconnect's own --resolve merges them).
+// The pin goes first only if this network's answers include it: one from another
+// network, e.g. a NAT64 address from cellular, can hang on Wi-Fi past the watchdog.
 static int pinned_getaddrinfo(void *priv, const char *node, const char *service,
                               const struct addrinfo *hints, struct addrinfo **res) {
     struct ocb_session *s = priv;
@@ -208,6 +210,10 @@ static int pinned_getaddrinfo(void *priv, const char *node, const char *service,
     int pinned_err = getaddrinfo(s->pin_ip, service, hints, &pinned);
     int normal_err = getaddrinfo(node, service, hints, &normal);
     if (pinned_err) { *res = normal; return normal_err; }
+    bool usable = normal_err != 0;
+    for (struct addrinfo *a = normal_err ? NULL : normal; a && !usable; a = a->ai_next)
+        usable = a->ai_addrlen == pinned->ai_addrlen && !memcmp(a->ai_addr, pinned->ai_addr, a->ai_addrlen);
+    if (!usable) { struct addrinfo *t = pinned; pinned = normal; normal = t; } // normal answers first
     struct addrinfo *tail = pinned;
     while (tail->ai_next) tail = tail->ai_next;
     tail->ai_next = normal_err ? NULL : normal;

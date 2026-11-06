@@ -1,18 +1,24 @@
 --- a/ssl.c
 +++ b/ssl.c
-@@ -271,7 +271,10 @@
- 	   just reuse its previous IP address. If we're talking to a proxy, we
- 	   can use *its* previous IP address. We expect it'll redo the DNS
- 	   lookup for the server anyway. */
+@@ -267,11 +267,12 @@
+ 	int ssl_sock = -1;
+ 	int err;
+ 
+-	/* If we're talking to a server which told us it has dynamic DNS, don't
+-	   just reuse its previous IP address. If we're talking to a proxy, we
+-	   can use *its* previous IP address. We expect it'll redo the DNS
+-	   lookup for the server anyway. */
 -	if (vpninfo->peer_addr && (!vpninfo->is_dyndns || vpninfo->proxy)) {
 +	/* A phone changes networks, and an address from one (e.g. a NAT64-translated
 +	 * one from cellular) may not work on the next: look the server up again every
-+	 * time, as for dynamic DNS, falling back to the cached address. */
++	 * time, as for dynamic DNS, falling back to the cached address. If we're
++	 * talking to a proxy, we can use *its* previous IP address. We expect it'll
++	 * redo the DNS lookup for the server anyway. */
 +	if (vpninfo->peer_addr && vpninfo->proxy) {
  	reconnect:
  #ifdef SOCK_CLOEXEC
  		ssl_sock = socket(vpninfo->peer_addr->sa_family, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_IP);
-@@ -322,6 +325,7 @@
+@@ -322,6 +323,7 @@
  		struct addrinfo hints, *result, *rp;
  		char *hostname;
  		char port[6];
@@ -20,7 +26,7 @@
  
  		memset(&hints, 0, sizeof(struct addrinfo));
  		hints.ai_family = AF_UNSPEC;
-@@ -528,13 +532,8 @@
+@@ -528,13 +530,8 @@
  			 * don't bother falling back to it if it didn't work. */
  			if (vpninfo->peer_addr && vpninfo->peer_addrlen == rp->ai_addrlen &&
  			    match_sockaddr(vpninfo->peer_addr, rp->ai_addr)) {
@@ -36,7 +42,7 @@
  			}
  		}
  		freeaddrinfo(result);
-@@ -544,7 +543,7 @@
+@@ -544,7 +541,7 @@
  				     _("Failed to connect to host %s\n"),
  				     vpninfo->proxy?:vpninfo->hostname);
  			ssl_sock = -EINVAL;
