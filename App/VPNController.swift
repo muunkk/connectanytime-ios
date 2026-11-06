@@ -86,6 +86,7 @@ final class VPNController: ObservableObject {
                 case .disconnected, .invalid: break
                 default: return self.lastError = "The last attempt is still stopping. Tap Connect again in a moment."
                 }
+                guard !ConnectIntent.disconnected else { return } // Disconnect tapped meanwhile
                 // Auto-connect stays off until the VPN is up (see armOnDemandIfConnected).
                 try (m.connection as? NETunnelProviderSession)?
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
@@ -114,12 +115,13 @@ final class VPNController: ObservableObject {
     /// to log in"), so turn them off, as Cisco's client stops once the session ends.
     /// Mostly for a phone updated from a build that left on-demand on: otherwise the
     /// button keeps flipping to Disconnect while iOS retries. Safe because on-demand is
-    /// only turned on once connected, and the session is saved before that.
+    /// only turned on once connected, the session is saved before that, and our own
+    /// logins run with on-demand off.
     private func disarmIfNothingToRejoin() {
-        guard [.disconnected, .invalid].contains(status), let m = manager, !SavedSessionItem.exists else { return }
+        guard ![.connected, .reasserting].contains(status), let m = manager, !SavedSessionItem.exists else { return }
         inOrder {
             try? await m.loadFromPreferences()
-            guard m.isOnDemandEnabled, [.disconnected, .invalid].contains(m.connection.status),
+            guard m.isOnDemandEnabled, ![.connected, .reasserting].contains(m.connection.status),
                   !SavedSessionItem.exists else { return }
             m.isOnDemandEnabled = false
             try? await m.saveToPreferences()
@@ -278,7 +280,7 @@ final class VPNController: ObservableObject {
             inOrder { await self.applyOnDemand() }
         }
         if status == .connected { armOnDemandIfConnected() }
-        if status == .disconnected { disarmIfNothingToRejoin() }
+        if [.disconnected, .connecting].contains(status) { disarmIfNothingToRejoin() }
         VPNQuickControl.reloadControl()
         if status == .disconnected, old != .disconnected {
             m.connection.fetchLastDisconnectError { error in

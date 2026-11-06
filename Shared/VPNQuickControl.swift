@@ -16,10 +16,19 @@ enum VPNQuickControl {
         try? await NETunnelProviderManager.loadAllFromPreferences().first
     }
 
-    /// On while connected or on the way there (e.g. waiting for Duo).
+    /// On while connected or on the way there (e.g. waiting for Duo). Not for an
+    /// automatic attempt with no session to rejoin, which can only fail, so a tap
+    /// takes over and logs in instead of turning it off.
     static func isOn() async -> Bool {
         guard let m = await manager() else { return false }
+        if isHopelessAutoAttempt(m) { return false }
         return [.connected, .connecting, .reasserting].contains(m.connection.status)
+    }
+
+    /// iOS's automatic attempt (manual logins save on-demand off first) with no saved
+    /// session: it can only fail with "tap Connect to log in".
+    static func isHopelessAutoAttempt(_ m: NETunnelProviderManager) -> Bool {
+        m.connection.status == .connecting && m.isOnDemandEnabled && !SavedSessionItem.exists
     }
 
     static func set(_ on: Bool) async throws {
@@ -29,6 +38,12 @@ enum VPNQuickControl {
         defer { reloadControl() }
         ConnectIntent.set(disconnected: !on)
         if on {
+            // Our own login is already waiting for Duo (on-demand is off for those):
+            // leave it be, or stopping it would mean a second push.
+            if c.status == .connecting, !m.isOnDemandEnabled {
+                await wait(c, whileIn: [.connecting], upTo: 90)
+                return await armIfConnected(m)
+            }
             // iOS disables this configuration whenever another VPN is used. The app's
             // Connect re-enables it on every save; the toggle has to as well.
             // Auto-connect stays off while connecting: with it on, iOS can hold other
@@ -45,6 +60,7 @@ enum VPNQuickControl {
             case .disconnected, .invalid: break
             default: return logger.error("The last attempt is still stopping; not starting")
             }
+            guard !ConnectIntent.disconnected else { return } // turned off meanwhile
             do {
                 try (c as? NETunnelProviderSession)?
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
@@ -104,8 +120,10 @@ enum VPNQuickControl {
     /// Lets an attempt already under way (iOS's automatic one) finish, for up to 10 s,
     /// then stops it. Call with on-demand saved off, so iOS doesn't start another, and
     /// never during a login of our own. Returns the status it ends in.
+    /// Returns early after a Disconnect, which then does the stopping.
     static func settle(_ c: NEVPNConnection) async -> NEVPNStatus {
-        await wait(c, whileIn: [.connecting], upTo: 10)
+        await wait(c, whileIn: [.connecting], upTo: 10, untilDisconnected: true)
+        if ConnectIntent.disconnected { return c.status }
         if c.status == .connecting { c.stopVPNTunnel() }
         await wait(c, whileIn: [.connecting, .disconnecting], upTo: 5)
         return c.status
@@ -114,9 +132,11 @@ enum VPNQuickControl {
     /// Waits up to `seconds` while the connection is in one of `states`. Control Center
     /// re-reads the toggle as soon as the action returns, so waiting briefly for the new
     /// state keeps it from snapping back to the old one.
-    static func wait(_ c: NEVPNConnection, whileIn states: Set<NEVPNStatus>, upTo seconds: TimeInterval = 2) async {
+    /// `untilDisconnected`: also stop waiting once you've turned the VPN off.
+    static func wait(_ c: NEVPNConnection, whileIn states: Set<NEVPNStatus>, upTo seconds: TimeInterval = 2,
+                     untilDisconnected: Bool = false) async {
         let deadline = Date().addingTimeInterval(seconds)
-        while states.contains(c.status), Date() < deadline {
+        while states.contains(c.status), Date() < deadline, !(untilDisconnected && ConnectIntent.disconnected) {
             do { try await Task.sleep(for: .milliseconds(100)) } catch { return } // cancelled
         }
     }
