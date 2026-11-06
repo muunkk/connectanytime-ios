@@ -17,7 +17,8 @@ final class VPNController: ObservableObject {
     @Published var stayConnected: Bool {
         didSet {
             UserDefaults.standard.set(stayConnected, forKey: "stayConnected")
-            inOrder { await self.applyOnDemand() }
+            let turnedOn = stayConnected
+            inOrder { await self.applyOnDemand(armIfConnected: turnedOn) }
         }
     }
     @Published private(set) var hasPassword = SharedKeychain.hasPassword
@@ -50,7 +51,7 @@ final class VPNController: ObservableObject {
         if existing != nil, UserDefaults.standard.integer(forKey: "onDemandRulesVersion") < Self.onDemandRulesVersion {
             inOrder {
                 // Only once saved, so a failed save is tried again next launch.
-                if await self.applyOnDemand() {
+                if await self.applyOnDemand(armIfConnected: true) {
                     UserDefaults.standard.set(Self.onDemandRulesVersion, forKey: "onDemandRulesVersion")
                 }
             }
@@ -169,15 +170,18 @@ final class VPNController: ObservableObject {
     }
 
     /// Saves the on-demand rules for the current settings. Returns whether it saved.
+    /// `armIfConnected`: also turn on-demand on if the VPN is up, for when Stay
+    /// Connected was just switched on. Other changes leave it as it is, so they can't
+    /// undo a Disconnect, including one from Control Center that's still saving.
     @discardableResult
-    private func applyOnDemand() async -> Bool {
+    private func applyOnDemand(armIfConnected: Bool = false) async -> Bool {
         guard let m = manager, m.protocolConfiguration != nil else { return false }
         try? await m.loadFromPreferences()
         let rules = onDemandRules()
         m.onDemandRules = rules
         if rules.isEmpty {
             m.isOnDemandEnabled = false
-        } else if stayConnected, !userDisconnected,
+        } else if armIfConnected, stayConnected, !userDisconnected,
                   [.connected, .connecting, .reasserting].contains(m.connection.status) {
             m.isOnDemandEnabled = true // already connected: start keeping it up now
         }
@@ -214,6 +218,7 @@ final class VPNController: ObservableObject {
         guard let m = manager else { return }
         let old = status
         status = m.connection.status
+        if status == .connected { userDisconnected = false } // e.g. reconnected from Control Center
         VPNQuickControl.reloadControl()
         if status == .disconnected, old != .disconnected {
             m.connection.fetchLastDisconnectError { error in

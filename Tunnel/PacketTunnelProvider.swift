@@ -39,7 +39,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Duo pushes or trying a wrong password. Each such failure in a row doubles the
     /// pause, so an ignored push overnight doesn't repeat every 15 minutes. Failing
     /// before that (no network yet) pauses briefly, to avoid a storm of attempts.
-    /// Manual connects are never blocked.
+    /// A failed manual connect starts the pause too, or iOS's on-demand retry right
+    /// after it would send a second push. Manual connects are never blocked.
     private static let autoRetryPause: TimeInterval = 15 * 60
     private static let maxAutoRetryPause: TimeInterval = 4 * 60 * 60
     private static let unreachablePause: TimeInterval = 60
@@ -102,7 +103,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             var err = [CChar](repeating: 0, count: 512)
             guard ocb_connect(s, &err, err.count) == 0 else {
                 let message = self.stopping ? "Cancelled." : String(cString: err)
-                if !manual, !self.stopping { Self.pauseAutoConnect(sentCredentials: ocb_sent_credentials(s) != 0) }
+                if !self.stopping { Self.pauseAutoConnect(sentCredentials: ocb_sent_credentials(s) != 0) }
                 self.finishSession()
                 return done(self.failure(message))
             }
