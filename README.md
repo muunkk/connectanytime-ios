@@ -27,9 +27,12 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
 - **Survives network changes.** Switch Wi-Fi, drop to cellular or lose signal for a while,
   and the VPN reconnects with the session it already has, like Cisco's client. No new
   login, no new Duo push, as long as the server still holds the session. It usually
-  reconnects within seconds, and keeps trying for up to 30 minutes; meanwhile traffic
-  waits rather than bypassing the VPN. If the server gives the phone a new VPN address
-  when it reconnects, the tunnel switches to it instead of disconnecting.
+  reconnects within seconds. It keeps trying through any number of network changes and
+  any time offline, and only stops once the server says the session is over (or it can't
+  reach the server for 30 minutes on a working network). Meanwhile traffic waits rather
+  than bypassing the VPN. If the server gives the phone a new VPN address when it
+  reconnects, the tunnel switches to it instead of disconnecting.
+- **Activity** in the app shows what the VPN did recently and why it stopped, if it did.
 - **Full tunnel**, like NYU's Cisco setup. IPv6 is dropped rather than bypassing the VPN.
 
 ## How it works

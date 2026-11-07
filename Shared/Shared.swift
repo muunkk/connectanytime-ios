@@ -78,3 +78,40 @@ enum KeychainItem {
         SecItemDelete(base(account) as CFDictionary)
     }
 }
+
+/// The VPN's recent activity (connects, network changes, reconnects, and why it
+/// stopped), written by the tunnel so the app can show why it dropped. In the Keychain
+/// like the rest, since there's no shared app group. Holds OpenConnect's status lines
+/// and our own, never the password or the session cookie.
+enum ActivityLog {
+    private static let account = "activity"
+    private static let maxLines = 300
+    private static let writes = DispatchQueue(label: "connectanytime.activity", qos: .utility)
+    /// Lines not yet saved. Only touched on `writes`.
+    nonisolated(unsafe) private static var pending: [String] = []
+
+    /// Saved within a second, a burst of lines in one Keychain write.
+    static func add(_ line: String) {
+        let stamped = "\(Date().formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits).second(.twoDigits))) \(line)"
+        writes.async {
+            pending.append(stamped)
+            if pending.count == 1 { writes.asyncAfter(deadline: .now() + 1) { save() } }
+        }
+    }
+
+    /// Saves now, e.g. before the tunnel stops.
+    static func flush() { writes.sync { save() } }
+
+    private static func save() {
+        guard !pending.isEmpty else { return }
+        let lines = read() + pending
+        pending = []
+        KeychainItem.save(lines.suffix(maxLines).joined(separator: "\n"), as: account)
+    }
+
+    static func read() -> [String] {
+        (KeychainItem.read(account) ?? "").split(separator: "\n").map(String.init)
+    }
+
+    static func clear() { KeychainItem.delete(account) }
+}

@@ -12,12 +12,20 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var _stopping = false
     /// Whether that stop logs out of the server's session (see stopTunnel).
     private var _logOutOnStop = false
+    /// The rejoin under way, so a timer can abort it if it hangs (under sessionLock).
+    private var _resumeToken: UUID?
     /// Set by stopTunnel on iOS's thread, read on `queue`.
     private var stopping: Bool { sessionLock.withLock { _stopping } }
     private var pathMonitor: NWPathMonitor?
     private var lastNetwork: String?
     private var watchdog: DispatchSourceTimer?
-    private var reconnectDeadline: Date?
+    /// Set while the connection is down and we're getting it back.
+    private var reconnectingSince: Date?
+    /// How long it's been down this time while there was a network (see checkReconnect).
+    private var downWhileOnline: TimeInterval = 0
+    private var lastDownCheck = Date()
+    /// Set once that's too long, so the connection ending stops the VPN.
+    private var givingUp = false
     private var lastReconnectKick = Date.distantPast
     /// Bumped whenever a reconnect starts, so the result of an earlier one (such as a
     /// slow settings update) can't mark a newer one as done or end it.
@@ -33,16 +41,25 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let epoch: Int // the reconnect that produced them
     }
     private var pendingReconnect: DispatchWorkItem?
+    /// The next try at rejoining the session on a new connection (see rejoin).
+    private var pendingRejoin: DispatchWorkItem?
+    private var lastRejoin = Date.distantPast
+    private var rejoinTries = 0
     private var server = ""
-    /// Why the session ended, when it's our doing rather than OpenConnect's.
+    private var user = ""
+    /// iOS's tunnel interface, kept across rejoins. -1 until the tunnel is up.
+    private var tunFD: Int32 = -1
+    /// Why we ended the connection, when it's our doing rather than OpenConnect's.
     private var endReason: String?
-    /// We ended it without logging out, so the saved session stays for a rejoin.
-    private var keepSessionOnEnd = false
 
-    /// How long to keep retrying a dropped connection with the existing session
-    /// (no Duo) before giving up, e.g. while walking between Wi-Fi networks.
-    /// The server may end the session sooner; then the next connect needs Duo.
-    private static let resumeWindow: Int32 = 30 * 60
+    /// OpenConnect's own limit on retrying a dropped connection. The watchdog restarts
+    /// its attempts every minute, so this isn't reached; and when its connection does
+    /// end, we rejoin the session on a new one (see rejoin).
+    private static let reconnectTimeout: Int32 = 30 * 60
+    /// Stop after this long unable to reach the server with a working network, so a
+    /// full tunnel can't block the internet indefinitely, say during an outage. Time
+    /// offline doesn't count. The session is kept, so the next start rejoins it.
+    private static let giveUpAfter: TimeInterval = 30 * 60
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         // Refresh the Control Center toggle whichever way this ends; otherwise it can
@@ -60,7 +77,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         let server = proto.serverAddress ?? AppConfig.defaultServer
         self.server = server
-        let saved = SessionStore.load().flatMap { $0.server == server && $0.user == user ? $0 : nil }
+        self.user = user
+        let saved = savedSession()
         log("Connecting to \(server) (\(manual ? "manual" : "auto")\(saved != nil ? ", rejoining session" : ""))")
 
         queue.async {
@@ -70,25 +88,26 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             // Rejoin the session from the last login if the server still has it: no
             // password, no Duo. This is how Stay Connected comes back after iOS stops
-            // the tunnel, e.g. with no network.
+            // the tunnel, e.g. with no network. An automatic start tries for a while
+            // before failing, since the network may still be coming up.
             if let saved {
-                guard let s = self.newSession(server: server, user: user, password: "") else {
-                    return done(self.failure(self.stopping ? "Cancelled." : "Couldn't start the VPN client."))
-                }
-                let result = ocb_resume(s, saved.url, saved.cookie, saved.dnsName, saved.ip, &err, err.count)
-                if result == 0 {
-                    session = s
-                    rejoined = saved
-                } else {
-                    let message = String(cString: err)
-                    self.finishSession()
+                for attempt in 1... {
+                    let (s, result) = self.resume(saved, err: &err)
+                    if let s {
+                        session = s
+                        rejoined = saved
+                        break
+                    }
                     if self.stopping { return done(self.failure("Cancelled.")) }
                     if result == OCB_SESSION_ENDED {
                         self.log("The server has ended the saved session")
                         SessionStore.clear()
-                    } else if !manual {
-                        // Keep the session: iOS tries again once there's a network.
-                        return done(self.failure(message))
+                        break
+                    }
+                    if manual { break } // log in instead
+                    // Keep the session: iOS tries again later.
+                    guard attempt < 4, self.sleepUnlessStopping(Double(attempt) * 5) else {
+                        return done(self.failure(self.stopping ? "Cancelled." : String(cString: err)))
                     }
                 }
             }
@@ -112,14 +131,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // Settings from builds that paused auto-connect after failed logins.
             UserDefaults.standard.removeObject(forKey: "autoPausedUntil")
             UserDefaults.standard.removeObject(forKey: "autoFailures")
-            if let url = ocb_session_url(s), let cookie = ocb_session_cookie(s) {
-                SessionStore.save(.init(server: server, user: user,
-                                        url: String(cString: url), cookie: String(cString: cookie),
-                                        // A rejoin keeps the login's address: on an IPv6-only
-                                        // network it would read as a translated one.
-                                        dnsName: rejoined?.dnsName ?? ocb_session_dnsname(s).map { String(cString: $0) },
-                                        ip: rejoined?.ip ?? ocb_session_ip(s).map { String(cString: $0) }))
-            }
+            self.saveSession(s, rejoined: rejoined)
             // Stopped just as the login finished: don't bring the tunnel up, and don't keep
             // a session you just disconnected.
             if self.stopping {
@@ -150,31 +162,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 }
                 self.log("Connected")
                 done(nil)
-                self.queue.async { self.watchNetwork() }
-
-                Thread {
-                    let result = ocb_run(s, fd, Self.resumeWindow) // blocks until cancelled or the session ends
-                    self.queue.async {
-                        let byServer = !self.stopping
-                        let reason = self.endReason
-                        let keepSession = self.keepSessionOnEnd
-                        self.finishSession()
-                        guard byServer else { return }
-                        // Ended by the server, or by us with a logout. Otherwise, e.g. no
-                        // network for too long, the next start tries to rejoin and the server
-                        // decides.
-                        if (reason != nil && !keepSession) || result == -EPERM || result == -EPIPE {
-                            SessionStore.clear()
-                        }
-                        let message = reason ?? (result == -EPERM
-                            ? "Your VPN session expired. Connect again to log in."
-                            : result == -EPIPE ? "The server ended the VPN session."
-                            : "The VPN session ended.")
-                        VPNQuickControl.reloadControl()
-                        self.cancelTunnelWithError(self.failure(message))
-                        VPNQuickControl.reloadControl()
-                    }
-                }.start()
+                self.queue.async {
+                    self.tunFD = fd
+                    self.watchNetwork()
+                    self.run(s)
+                }
             }
         }
     }
@@ -184,13 +176,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // sleep, an update), leave the server's session open, like Cisco's client, so
         // the next start rejoins it without Duo.
         let logOut = Self.endsSession(reason)
-        log("Stopping (reason \(reason.rawValue)\(logOut ? "" : ", keeping the session"))")
+        log("Stopping (\(Self.describe(reason))\(logOut ? "" : ", keeping the session"))")
         sessionLock.withLock {
             _stopping = true
             _logOutOnStop = logOut
             if let s = session { logOut ? ocb_cancel(s) : ocb_detach(s) }
         }
         if logOut { SessionStore.clear() }
+        ActivityLog.flush()
         completionHandler()
         VPNQuickControl.reloadControl()
     }
@@ -228,6 +221,56 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         return stopped ? nil : s
     }
 
+    /// The session from the last login, if it's for this server and NetID.
+    private func savedSession() -> SavedSession? {
+        SessionStore.load().flatMap { $0.server == server && $0.user == user ? $0 : nil }
+    }
+
+    /// Keeps what rejoining `s` takes. A rejoin keeps the login's address: on an
+    /// IPv6-only network it would read as a translated one.
+    private func saveSession(_ s: OpaquePointer, rejoined: SavedSession?) {
+        guard let url = ocb_session_url(s), let cookie = ocb_session_cookie(s) else { return }
+        SessionStore.save(.init(server: server, user: user,
+                                url: String(cString: url), cookie: String(cString: cookie),
+                                dnsName: rejoined?.dnsName ?? ocb_session_dnsname(s).map { String(cString: $0) },
+                                ip: rejoined?.ip ?? ocb_session_ip(s).map { String(cString: $0) }))
+    }
+
+    /// Rejoins `saved` on a new OpenConnect session, which becomes the current one.
+    /// Returns it, or nil with ocb_resume's result (OCB_SESSION_ENDED if the server no
+    /// longer has the session). A connect or TLS handshake has no timeout of its own,
+    /// so an attempt that hangs is aborted after 30 s. Blocks; call on `queue`.
+    private func resume(_ saved: SavedSession, err: inout [CChar]) -> (OpaquePointer?, Int32) {
+        guard let s = newSession(server: server, user: user, password: "") else { return (nil, -1) }
+        let token = UUID()
+        sessionLock.withLock { _resumeToken = token }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 30) { [weak self] in
+            guard let self else { return }
+            let stuck = self.sessionLock.withLock {
+                guard self._resumeToken == token, let s = self.session else { return false }
+                ocb_detach(s) // fails the attempt, leaving the server's session open
+                return true
+            }
+            if stuck { self.log("Rejoining is taking too long; giving up on this attempt") }
+        }
+        let result = ocb_resume(s, saved.url, saved.cookie, saved.dnsName, saved.ip, &err, err.count)
+        sessionLock.withLock { _resumeToken = nil }
+        if result == 0 { return (s, 0) }
+        log("Couldn't rejoin the session: \(String(cString: err))")
+        freeSession()
+        return (nil, result)
+    }
+
+    /// Waits, returning early (false) if the tunnel is stopping.
+    private func sleepUnlessStopping(_ seconds: Double) -> Bool {
+        let until = Date().addingTimeInterval(seconds)
+        while Date() < until {
+            if stopping { return false }
+            Thread.sleep(forTimeInterval: 0.25)
+        }
+        return !stopping
+    }
+
     /// Why this start mustn't log in, or nil if it may. Logging in sends a Duo push, so
     /// like Cisco's client only a connect you asked for does it. An automatic one can't
     /// work anyway: while on-demand is starting the VPN, iOS holds other apps'
@@ -251,40 +294,166 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
-    private func finishSession() {
-        pathMonitor?.cancel()
-        pathMonitor = nil
-        lastNetwork = nil
-        watchdog?.cancel()
-        watchdog = nil
-        reconnectDeadline = nil
-        pendingReconnect?.cancel()
-        pendingReconnect = nil
-        endReason = nil
-        keepSessionOnEnd = false
-        installedKey = nil
-        wanted = nil
-        applyingSettings = false
+    private static func describe(_ reason: NEProviderStopReason) -> String {
+        switch reason {
+        case .none: "no reason"
+        case .userInitiated: "turned off"
+        case .providerFailed: "the VPN extension failed"
+        case .noNetworkAvailable: "no network"
+        case .unrecoverableNetworkChange: "network change"
+        case .providerDisabled: "VPN extension disabled"
+        case .authenticationCanceled: "login cancelled"
+        case .configurationFailed: "configuration failed"
+        case .idleTimeout: "idle"
+        case .configurationDisabled: "VPN configuration disabled"
+        case .configurationRemoved: "VPN configuration removed"
+        case .superceded: "another VPN took over"
+        case .userLogout: "user logged out"
+        case .userSwitch: "user switched"
+        case .connectionFailed: "connection failed"
+        case .sleep: "sleep"
+        case .appUpdate: "app update"
+        case .internalError: "iOS internal error"
+        @unknown default: "reason \(reason.rawValue)"
+        }
+    }
+
+    private static func describe(_ type: NWInterface.InterfaceType?) -> String {
+        switch type {
+        case .wifi: "Wi-Fi"
+        case .cellular: "cellular"
+        case .wiredEthernet: "Ethernet"
+        default: "other"
+        }
+    }
+
+    /// Frees the OpenConnect session, leaving the tunnel up.
+    private func freeSession() {
         sessionLock.withLock {
             if let s = session { ocb_free(s) }
             session = nil
         }
     }
 
+    private func finishSession() {
+        pathMonitor?.cancel()
+        pathMonitor = nil
+        lastNetwork = nil
+        watchdog?.cancel()
+        watchdog = nil
+        reconnectingSince = nil
+        downWhileOnline = 0
+        givingUp = false
+        pendingReconnect?.cancel()
+        pendingReconnect = nil
+        pendingRejoin?.cancel()
+        pendingRejoin = nil
+        endReason = nil
+        installedKey = nil
+        wanted = nil
+        applyingSettings = false
+        tunFD = -1
+        freeSession()
+    }
+
+    /// Runs the tunnel on `s` until it ends, then rejoins the session on a new one.
+    private func run(_ s: OpaquePointer) {
+        let fd = tunFD
+        Thread {
+            let result = ocb_run(s, fd, Self.reconnectTimeout) // blocks until cancelled or the connection ends
+            self.queue.async { self.connectionEnded(s, result: result) }
+        }.start()
+    }
+
+    /// OpenConnect's connection ended: it gave up retrying, the server refused or ended
+    /// it, or we aborted it. Unless you're disconnecting, that doesn't end the VPN:
+    /// rejoining the session settles whether the server still has it. If it does, the
+    /// tunnel carries on, as Cisco's client does, with no Duo; if the server answers
+    /// that it's over, only then does the VPN stop and wait for you to tap Connect.
+    private func connectionEnded(_ s: OpaquePointer, result: Int32) {
+        guard session == s else { return }
+        let reason = endReason
+        endReason = nil
+        freeSession()
+        if stopping { return finishSession() }
+        if givingUp { return giveUp() }
+        log("The connection ended (\(reason ?? String(cString: strerror(-result)))); rejoining the session")
+        scheduleRejoin()
+    }
+
+    /// Rejoin right away the first time; back off while it keeps failing or dropping.
+    private func scheduleRejoin() {
+        pendingRejoin?.cancel()
+        if Date().timeIntervalSince(lastRejoin) > 120 { rejoinTries = 0 }
+        let delay = rejoinTries == 0 ? 0 : min(5 * pow(2, Double(rejoinTries - 1)), 60)
+        rejoinTries += 1
+        if delay > 0 { log("Trying to rejoin again in \(Int(delay)) s") }
+        let work = DispatchWorkItem { [weak self] in self?.rejoin() }
+        pendingRejoin = work
+        queue.asyncAfter(deadline: .now() + delay, execute: work)
+    }
+
+    /// Rejoins the session on a new OpenConnect session, on the same tunnel, which
+    /// stays up meanwhile ("Reconnecting…"; traffic waits rather than bypassing the
+    /// VPN). Keeps trying, straight away after a network change, until it's back, the
+    /// server says the session has ended, or you disconnect.
+    private func rejoin() {
+        pendingRejoin = nil
+        guard !stopping, tunFD >= 0 else { return finishSession() }
+        guard session == nil else { return }
+        reconnecting()
+        lastRejoin = Date()
+        guard let saved = savedSession() else {
+            return end("The VPN session has ended. Tap Connect in ConnectAnytime to log in again.")
+        }
+        var err = [CChar](repeating: 0, count: 512)
+        let (s, result) = resume(saved, err: &err)
+        // Saved before checking for a stop, so a Disconnect meanwhile can't have its
+        // logout undone: either it clears the session after this, or we do below.
+        if let s { saveSession(s, rejoined: saved) }
+        if stopping {
+            if sessionLock.withLock({ _logOutOnStop }) { SessionStore.clear() }
+            return finishSession()
+        }
+        guard let s else {
+            if result == OCB_SESSION_ENDED {
+                SessionStore.clear()
+                return end("The server has ended your VPN session. Tap Connect to log in again.")
+            }
+            return scheduleRejoin()
+        }
+        log("Rejoined the session")
+        var cfg = ocb_config()
+        let config = ocb_get_config(s, &cfg) == 0
+            ? cfg.key.map { (key: String(cString: $0), settings: Self.networkSettings(cfg, server: server)) } : nil
+        ocb_config_free(&cfg)
+        reconnected(config) // as after OpenConnect's own reconnects: apply any new settings
+        run(s)
+    }
+
+    /// Stops the VPN. Call with no OpenConnect session running.
+    private func end(_ message: String) {
+        finishSession()
+        VPNQuickControl.reloadControl()
+        cancelTunnelWithError(failure(message))
+        VPNQuickControl.reloadControl()
+    }
+
     /// On a network change, reconnect right away with the existing session
     /// instead of waiting for the old connection to time out. Like Cisco's
     /// client, this doesn't log in again, so there's no Duo push.
     private func watchNetwork() {
-        guard session != nil, pathMonitor == nil else { return }
+        guard tunFD >= 0, pathMonitor == nil else { return }
         let monitor = NWPathMonitor(prohibitedInterfaceTypes: [.other, .loopback]) // skip our own tunnel
         monitor.pathUpdateHandler = { [weak self] path in
-            guard let self, self.session != nil else { return }
+            guard let self, self.tunFD >= 0 else { return }
             // The first interface is the one in use. Its name alone misses Wi-Fi → Wi-Fi
             // (both en0); the gateway differs.
             let network = path.status != .satisfied ? "offline"
                 : ([path.availableInterfaces.first?.name ?? ""] + path.gateways.map { "\($0)" }.sorted()).joined(separator: ",")
             defer { self.lastNetwork = network }
             guard let last = self.lastNetwork, last != network else { return }
+            self.log(network == "offline" ? "Network lost" : "Network changed (\(Self.describe(path.availableInterfaces.first?.type)))")
             self.reconnecting()
             guard network != "offline" else { return }
             // Path updates come in bursts (interface, then gateways); reconnect once,
@@ -292,9 +461,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // ones only add churn.
             self.pendingReconnect?.cancel()
             let work = DispatchWorkItem { [weak self] in
-                guard let self, self.session != nil else { return }
-                self.log("Network changed; reconnecting with the existing session")
-                self.kickReconnect()
+                guard let self, self.tunFD >= 0, !self.stopping else { return }
+                if let rejoin = self.pendingRejoin {
+                    rejoin.cancel()
+                    self.rejoinTries = 0
+                    self.log("Rejoining the session on the new network")
+                    self.rejoin()
+                } else if self.session != nil {
+                    self.log("Reconnecting with the existing session")
+                    self.kickReconnect()
+                }
             }
             self.pendingReconnect = work
             self.queue.asyncAfter(deadline: .now() + 2, execute: work)
@@ -314,8 +490,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func reconnecting(attempt: Bool = false) {
         reasserting = true
         reconnectEpoch += 1
-        if reconnectDeadline == nil {
-            reconnectDeadline = Date().addingTimeInterval(TimeInterval(Self.resumeWindow))
+        if reconnectingSince == nil {
+            reconnectingSince = Date()
+            downWhileOnline = 0
+            lastDownCheck = Date()
             lastReconnectKick = Date() // give the attempt underway, or about to be kicked, its minute
         }
         if attempt { lastReconnectKick = Date() }
@@ -348,18 +526,18 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         applyingSettings = true
         setTunnelNetworkSettings(want.settings) { error in
             self.queue.async {
-                guard let s = self.session else { return }
                 self.applyingSettings = false
                 if error == nil { self.installedKey = want.key }
+                guard let s = self.session else { return } // between connections: the rejoin applies its own
                 if let newer = self.wanted, newer.epoch != want.epoch || newer.key != want.key {
                     return self.applyWantedSettings() // the server sent newer settings meanwhile
                 }
                 self.wanted = nil
                 guard want.epoch == self.reconnectEpoch else { return } // a newer reconnect will apply its own
                 if let error {
-                    self.endReason = "Couldn't apply new VPN settings: \(error.localizedDescription)"
-                    self.log(self.endReason!)
-                    ocb_cancel(s)
+                    // Try again on a new connection, keeping the session.
+                    self.endReason = "couldn't apply new VPN settings: \(error.localizedDescription)"
+                    ocb_detach(s)
                 } else {
                     self.finishReconnect(epoch: want.epoch)
                 }
@@ -370,8 +548,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Clears "Reconnecting…" unless another reconnect has started since.
     private func finishReconnect(epoch: Int) {
         guard epoch == reconnectEpoch else { return }
+        if reconnectingSince != nil { log("Back up") }
         reasserting = false
-        reconnectDeadline = nil
+        reconnectingSince = nil
+        downWhileOnline = 0
     }
 
     /// Drop the current connection and reconnect now with the existing session.
@@ -382,22 +562,31 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ocb_reconnect(s)
     }
 
-    /// OpenConnect's retry timeout only counts its sleeps, and a connect or TLS
-    /// handshake can hang with no timeout. While reconnecting, retry a minute after
-    /// the latest attempt started (not sooner: that would abort it), and give up by
-    /// the clock, so a full tunnel can't blackhole traffic for long.
+    /// Every 10 s. OpenConnect's retry timeout only counts its sleeps, and a connect or
+    /// TLS handshake can hang with no timeout. While reconnecting, retry a minute after
+    /// the latest attempt started (not sooner: that would abort it). Not while offline:
+    /// the network coming back starts an attempt.
     private func checkReconnect() {
-        guard let s = session, let deadline = reconnectDeadline else { return }
-        if Date() >= deadline {
-            endReason = "Couldn't reconnect in \(Self.resumeWindow / 60) minutes. Connect again to log in."
-            log("Couldn't reconnect in \(Self.resumeWindow / 60) minutes; stopping")
-            // Without logging out: if the server still has the session when there's a
-            // network again, the next start rejoins it without Duo.
-            keepSessionOnEnd = true
-            ocb_detach(s)
-        } else if Date().timeIntervalSince(lastReconnectKick) >= 60 {
-            kickReconnect()
+        // By the clock: a rejoin attempt blocks `queue`, so ticks can be skipped. Capped,
+        // since a sleeping phone skips them too.
+        let elapsed = min(Date().timeIntervalSince(lastDownCheck), 60)
+        lastDownCheck = Date()
+        guard reconnectingSince != nil, lastNetwork != "offline", !givingUp else { return }
+        downWhileOnline += elapsed
+        if downWhileOnline >= Self.giveUpAfter {
+            log("Couldn't reach the VPN server in \(Int(Self.giveUpAfter / 60)) minutes; stopping")
+            givingUp = true
+            // Ends the connection without logging out; connectionEnded then stops.
+            guard let s = session else { return giveUp() }
+            return ocb_detach(s)
         }
+        if session != nil, Date().timeIntervalSince(lastReconnectKick) >= 60 { kickReconnect() }
+    }
+
+    /// Stops the VPN, keeping the session: if the server still has it once it can be
+    /// reached, Stay Connected or the next Connect rejoins it without Duo.
+    private func giveUp() {
+        end("Couldn't reach the VPN server for \(Int(Self.giveUpAfter / 60)) minutes. Tap Connect to try again.")
     }
 
     /// What rejoining the last session takes: the server's address after any redirects,
@@ -422,12 +611,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     private func failure(_ message: String) -> NSError {
         log("Failed: \(message)")
+        ActivityLog.flush() // iOS may end this process right after
         return NSError(domain: "ConnectAnytime", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
     /// OpenConnect's INFO-level messages and our own; never contains typed input.
     private func log(_ message: String) {
         logger.log("\(message, privacy: .public)")
+        // Not the retry countdowns, which would push out what led up to them.
+        if !message.hasPrefix("sleep ") { ActivityLog.add(message) }
     }
 
     private static func networkSettings(_ cfg: ocb_config, server: String) -> NEPacketTunnelNetworkSettings {
