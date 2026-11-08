@@ -110,7 +110,11 @@ enum VPNQuickControl {
         // disconnected meanwhile, or a new login started, don't leave it on. (Rolling
         // back saves the configuration, so a login started in the same instant could
         // see one save mid-connect; that takes a tap within a moment of this one.)
-        if ConnectIntent.disconnected || ![.connected, .reasserting].contains(m.connection.status) {
+        // Not just because the VPN dropped meanwhile: with a session to rejoin, that's
+        // when it's needed, to bring it back. A new login only runs without one.
+        let status = m.connection.status
+        let newLogin = [.connecting, .disconnected, .invalid].contains(status) && !SavedSessionItem.exists
+        if ConnectIntent.disconnected || newLogin {
             logger.log("Disconnected while turning auto-connect on; turning it off again")
             try? await m.loadFromPreferences()
             m.isOnDemandEnabled = false
