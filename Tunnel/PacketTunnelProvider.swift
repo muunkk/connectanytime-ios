@@ -93,14 +93,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         log("Connecting to \(server) (\(manual ? "manual" : "auto")\(saved != nil ? ", rejoining session" : ""))")
         // The network it starts on, for the Activity log; watchNetwork only runs once
-        // the tunnel is up. Holds itself until its first update.
+        // the tunnel is up. Its handler holds it until the first update; clearing the
+        // handler is what releases it.
         let probe = NWPathMonitor(prohibitedInterfaceTypes: [.other, .loopback])
         probe.pathUpdateHandler = { [weak self] path in
             probe.pathUpdateHandler = nil
             probe.cancel()
             self?.log("Network at start: \(Self.describe(path))")
         }
-        probe.start(queue: .global(qos: .utility))
+        probe.start(queue: DispatchQueue(label: "connectanytime.probe", qos: .utility))
 
         queue.async {
             var err = [CChar](repeating: 0, count: 512)
@@ -427,10 +428,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// IP versions and DNS it offers (an IPv6-only one means NAT64).
     private static func describe(_ path: Network.NWPath) -> String {
         let ip = [path.supportsIPv4 ? "IPv4" : nil, path.supportsIPv6 ? "IPv6" : nil].compactMap { $0 }
-        return ([path.availableInterfaces.first?.name ?? "?"] + path.gateways.map { "via \($0)" }
+        let parts = (path.status == .satisfied ? [] : ["not working (\(path.status))"])
+            + [path.availableInterfaces.first?.name ?? "?"] + path.gateways.map { "via \($0)" }
             + [ip.isEmpty ? "no IP" : ip.joined(separator: "+"), path.supportsDNS ? "DNS" : "no DNS"]
-            + (path.isExpensive ? ["expensive"] : []) + (path.isConstrained ? ["low data"] : []))
-            .joined(separator: ", ")
+            + (path.isExpensive ? ["expensive"] : []) + (path.isConstrained ? ["low data"] : [])
+        return parts.joined(separator: ", ")
     }
 
     /// The tunnel's address and MTU, for the Activity log.
