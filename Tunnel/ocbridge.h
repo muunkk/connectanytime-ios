@@ -47,6 +47,8 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen);
 /// on. 0 on success, OCB_SESSION_ENDED if the server no longer accepts the session,
 /// any other negative value on other failures (e.g. no network).
 #define OCB_SESSION_ENDED (-2)
+/// The server answered, with an HTTP error other than 401: it may not have the session.
+#define OCB_REFUSED (-4)
 int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *dnsname,
                const char *ip, char *err, size_t errlen);
 

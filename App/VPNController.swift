@@ -283,7 +283,7 @@ final class VPNController: ObservableObject {
     /// another push. Not after a Disconnect (app or Control Center) until the next
     /// connect, even if a late status update still says connected.
     private func armOnDemandIfConnected() {
-        guard status == .connected, !ConnectIntent.disconnected, let m = manager else { return }
+        guard VPNQuickControl.mayArm(status), !ConnectIntent.disconnected, let m = manager else { return }
         inOrder { await VPNQuickControl.armIfConnected(m) }
     }
 
@@ -316,7 +316,7 @@ final class VPNController: ObservableObject {
             rulesSavePending = false
             inOrder { await self.applyOnDemand() }
         }
-        if status == .connected { armOnDemandIfConnected() }
+        if VPNQuickControl.mayArm(status) { armOnDemandIfConnected() }
         if [.disconnected, .connecting].contains(status) { disarmIfNothingToRejoin() }
         VPNQuickControl.reloadControl()
         if status == .disconnected, old != .disconnected {

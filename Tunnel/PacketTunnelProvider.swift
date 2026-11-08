@@ -75,6 +75,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         self.server = server
         self.user = user
         let saved = savedSession()
+        // One saved for another NetID or server, before you changed it: no use now.
+        if saved == nil, SessionStore.load() != nil { SessionStore.clear() }
         if RunMarker.isSet {
             // Set while the tunnel is up, cleared whenever it stops: so the last run ended
             // without stopping, e.g. iOS ended the extension or it crashed.
@@ -106,6 +108,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         SessionStore.clear()
                         break
                     }
+                    // You asked to connect and the server answered, but wouldn't take the
+                    // session: log in rather than retry it indefinitely.
+                    if manual, result == OCB_REFUSED { break }
                     // The server may well still have the session; it just can't be reached
                     // right now (no signal, a network still coming up). Like Cisco's client,
                     // stay on: bring the VPN up on the last settings, so traffic waits

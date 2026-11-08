@@ -102,7 +102,7 @@ enum VPNQuickControl {
     /// Never after a Disconnect, from the app or Control Center, until the next connect.
     static func armIfConnected(_ m: NETunnelProviderManager) async {
         try? await m.loadFromPreferences()
-        guard m.connection.status == .connected, !m.isOnDemandEnabled,
+        guard mayArm(m.connection.status), !m.isOnDemandEnabled,
               !(m.onDemandRules ?? []).isEmpty, !ConnectIntent.disconnected else { return }
         m.isOnDemandEnabled = true
         guard (try? await m.saveToPreferences()) != nil else { return }
@@ -120,6 +120,13 @@ enum VPNQuickControl {
             m.isOnDemandEnabled = false
             try? await m.saveToPreferences()
         }
+    }
+
+    /// Whether Stay Connected may be turned on in `status`: connected, or reconnecting a
+    /// session it has (e.g. a Connect that came up on the last settings while the server
+    /// can't be reached). Not while connecting: a login may be waiting for Duo.
+    static func mayArm(_ status: NEVPNStatus) -> Bool {
+        status == .connected || status == .reasserting && SavedSessionItem.exists
     }
 
     /// Lets an attempt already under way (iOS's automatic one) finish, for up to 10 s,
