@@ -23,7 +23,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var reconnectingSince: Date?
     /// How long it's been down this time while there was a network (see checkReconnect).
     private var downWhileOnline: TimeInterval = 0
-    private var lastDownCheck = Date()
+    /// When checkReconnect last counted, in time the phone was awake (see awakeNow).
+    private var lastDownCheck = PacketTunnelProvider.awakeNow
     /// Set once that's too long, so the connection ending stops the VPN.
     private var givingUp = false
     private var lastReconnectKick = Date.distantPast
@@ -79,6 +80,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         self.server = server
         self.user = user
         let saved = savedSession()
+        if RunMarker.isSet {
+            // Set while the tunnel is up, cleared whenever it stops: so the last run ended
+            // without stopping, e.g. iOS ended the extension or it crashed.
+            log("The VPN extension quit unexpectedly last time")
+            RunMarker.clear()
+        }
         log("Connecting to \(server) (\(manual ? "manual" : "auto")\(saved != nil ? ", rejoining session" : ""))")
 
         queue.async {
@@ -117,17 +124,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 guard let password = SharedKeychain.read() else {
                     return done(self.failure("Open ConnectAnytime and save your password."))
                 }
-                guard let s = self.newSession(server: server, user: user, password: password) else {
-                    return done(self.failure(self.stopping ? "Cancelled." : "Couldn't start the VPN client."))
-                }
-                guard ocb_connect(s, &err, err.count) == 0 else {
-                    let message = self.stopping ? "Cancelled." : String(cString: err)
+                // A network just joined, such as another iPhone's hotspot, can take a few
+                // seconds to carry traffic. If the server wasn't reached, the password
+                // wasn't sent and there was no Duo push, so try again before failing.
+                for attempt in 1... {
+                    guard let s = self.newSession(server: server, user: user, password: password) else {
+                        return done(self.failure(self.stopping ? "Cancelled." : "Couldn't start the VPN client."))
+                    }
+                    let result = ocb_connect(s, &err, err.count)
+                    if result == 0 {
+                        session = s
+                        break
+                    }
                     self.finishSession()
-                    return done(self.failure(message))
+                    if self.stopping { return done(self.failure("Cancelled.")) }
+                    let message = String(cString: err)
+                    guard result == OCB_UNREACHABLE, attempt < 3 else { return done(self.failure(message)) }
+                    self.log("\(message) Trying again")
+                    guard self.sleepUnlessStopping(Double(attempt) * 3) else { return done(self.failure("Cancelled.")) }
                 }
-                session = s
             }
-            guard let s = session else { return }
+            guard let s = session else { return done(self.failure("Couldn't start the VPN client.")) }
             // Settings from builds that paused auto-connect after failed logins.
             UserDefaults.standard.removeObject(forKey: "autoPausedUntil")
             UserDefaults.standard.removeObject(forKey: "autoFailures")
@@ -161,6 +178,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     return done(self.failure("Couldn't find the tunnel interface."))
                 }
                 self.log("Connected")
+                if !self.stopping { RunMarker.set() }
                 done(nil)
                 self.queue.async {
                     self.tunFD = fd
@@ -183,6 +201,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             if let s = session { logOut ? ocb_cancel(s) : ocb_detach(s) }
         }
         if logOut { SessionStore.clear() }
+        RunMarker.clear()
         ActivityLog.flush()
         completionHandler()
         VPNQuickControl.reloadControl()
@@ -434,6 +453,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Stops the VPN. Call with no OpenConnect session running.
     private func end(_ message: String) {
         finishSession()
+        RunMarker.clear()
         VPNQuickControl.reloadControl()
         cancelTunnelWithError(failure(message))
         VPNQuickControl.reloadControl()
@@ -493,7 +513,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         if reconnectingSince == nil {
             reconnectingSince = Date()
             downWhileOnline = 0
-            lastDownCheck = Date()
+            lastDownCheck = Self.awakeNow
             lastReconnectKick = Date() // give the attempt underway, or about to be kicked, its minute
         }
         if attempt { lastReconnectKick = Date() }
@@ -567,10 +587,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// the latest attempt started (not sooner: that would abort it). Not while offline:
     /// the network coming back starts an attempt.
     private func checkReconnect() {
-        // By the clock: a rejoin attempt blocks `queue`, so ticks can be skipped. Capped,
-        // since a sleeping phone skips them too.
-        let elapsed = min(Date().timeIntervalSince(lastDownCheck), 60)
-        lastDownCheck = Date()
+        // By the clock, since a rejoin attempt blocks `queue` and ticks are skipped. Only
+        // time awake counts: a phone asleep overnight can't reconnect until it wakes, and
+        // the hours it slept mustn't add up to giving up a session the server still has.
+        let now = Self.awakeNow
+        let elapsed = now - lastDownCheck
+        lastDownCheck = now
         guard reconnectingSince != nil, lastNetwork != "offline", !givingUp else { return }
         downWhileOnline += elapsed
         if downWhileOnline >= Self.giveUpAfter {
@@ -581,6 +603,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             return ocb_detach(s)
         }
         if session != nil, Date().timeIntervalSince(lastReconnectKick) >= 60 { kickReconnect() }
+    }
+
+    /// Seconds the phone has been awake since it started. Unlike Date, it stands still
+    /// while the phone sleeps (mach_absolute_time).
+    private static var awakeNow: TimeInterval {
+        TimeInterval(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
     }
 
     /// Stops the VPN, keeping the session: if the server still has it once it can be
@@ -607,6 +635,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             KeychainItem.save(String(decoding: data, as: UTF8.self), as: SavedSessionItem.account)
         }
         static func clear() { KeychainItem.delete(SavedSessionItem.account) }
+    }
+
+    /// Whether the tunnel is up, kept across launches of the extension, so the next start
+    /// can tell when the last run ended without stopping (see startTunnel).
+    private enum RunMarker {
+        private static let account = "running"
+        static var isSet: Bool { KeychainItem.read(account) != nil }
+        static func set() { KeychainItem.save("1", as: account) }
+        static func clear() { KeychainItem.delete(account) }
     }
 
     private func failure(_ message: String) -> NSError {

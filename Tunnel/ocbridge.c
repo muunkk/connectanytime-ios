@@ -4,6 +4,7 @@
 #include <Security/Security.h>
 #include <errno.h>
 #include <netdb.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -24,6 +25,7 @@ struct ocb_session {
     void *ctx;
     bool answered_user, answered_password, answered_second;
     char auth_error[512];
+    char first_error[256]; // OpenConnect's first error in ocb_connect, to say why it failed
     char *connect_url;
     char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
 };
@@ -54,12 +56,17 @@ static void progress_cb(void *priv, int level, const char *fmt, ...) {
     else if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
                           !strncmp(fmt, "sleep %ds", 9)))
         s->event(s->ctx, OCB_RECONNECTING, NULL);
-    if (level > PRG_INFO || !s->log) return;
+    if (level > PRG_INFO) return;
     char buf[1024];
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(buf, sizeof buf, fmt, ap);
     va_end(ap);
+    if (level == PRG_ERR && !s->first_error[0]) {
+        snprintf(s->first_error, sizeof s->first_error, "%s", buf);
+        size_t n = strlen(s->first_error);
+        while (n && (s->first_error[n - 1] == '\n' || s->first_error[n - 1] == '\r')) s->first_error[--n] = 0;
+    }
     logf_(s, level, "%s", buf);
 }
 
@@ -154,7 +161,15 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
                      const char *second_password, ocb_log_fn log,
                      ocb_event_fn event, void *ctx) {
     static bool ssl_ready = false;
-    if (!ssl_ready) { openconnect_init_ssl(); ssl_ready = true; }
+    if (!ssl_ready) {
+        // A write to a connection the server or the network has reset raises SIGPIPE,
+        // which would kill the extension and drop the VPN. OpenSSL and OpenConnect write
+        // with plain send(), and only OpenConnect's command-line tool ignores it, so do
+        // it here: the write fails with EPIPE instead, and the reconnect logic handles it.
+        signal(SIGPIPE, SIG_IGN);
+        openconnect_init_ssl();
+        ssl_ready = true;
+    }
 
     struct ocb_session *s = calloc(1, sizeof *s);
     if (!s) return NULL;
@@ -179,8 +194,21 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Invalid server address.");
         return -1;
     }
+    s->first_error[0] = 0;
     if (openconnect_obtain_cookie(s->vpn)) {
-        snprintf(err, errlen, "%s", s->auth_error[0] ? s->auth_error : "Login failed or was cancelled.");
+        if (s->auth_error[0]) {
+            snprintf(err, errlen, "%s", s->auth_error);
+            return -1;
+        }
+        // Nothing secret sent yet, so no Duo push and nothing to lock the account:
+        // the network didn't get us to the login form. Safe to try again.
+        if (!s->answered_password && !s->answered_second) {
+            snprintf(err, errlen, "Couldn't reach the VPN server on this network%s%s%s",
+                     s->first_error[0] ? " (" : "", s->first_error, s->first_error[0] ? ")." : ".");
+            return OCB_UNREACHABLE;
+        }
+        snprintf(err, errlen, "Login failed or was cancelled%s%s%s",
+                 s->first_error[0] ? " (" : "", s->first_error, s->first_error[0] ? ")." : ".");
         return -1;
     }
     if (openconnect_make_cstp_connection(s->vpn)) {

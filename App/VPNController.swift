@@ -1,6 +1,7 @@
 import Foundation
 import NetworkExtension
 import SwiftUI
+import UIKit
 
 /// Owns the single VPN configuration and drives connect/disconnect.
 @MainActor
@@ -74,6 +75,7 @@ final class VPNController: ObservableObject {
         guard hasPassword else { return lastError = "Save your password first." }
         guard ![.connected, .reasserting].contains(status) else { return }
         ConnectIntent.set(disconnected: false)
+        var started: NEVPNConnection?
         await inOrder {
             guard let m = self.manager else { return }
             guard await self.mayStartLogin(m) else { return }
@@ -93,10 +95,40 @@ final class VPNController: ObservableObject {
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
                 // Until iOS reports the start, so a Connect queued behind this one sees it.
                 await VPNQuickControl.wait(m.connection, whileIn: [.disconnected, .invalid])
+                started = m.connection
             } catch {
                 self.lastError = error.localizedDescription
             }
         }.value
+        if let started { armWhenConnected(started) }
+    }
+
+    /// Turns Stay Connected on once this login is through. Approving Duo usually means
+    /// leaving the app, for the Duo app or its notification, and iOS suspends the app
+    /// soon after; it would then miss the VPN coming up, and Stay Connected would stay
+    /// off until you next opened the app, so a drop meanwhile would leave the VPN off.
+    /// Background time lets it see the login through (iOS allows about 30 s).
+    private func armWhenConnected(_ c: NEVPNConnection) {
+        let app = UIApplication.shared
+        let task = BackgroundTask()
+        task.id = app.beginBackgroundTask(withName: "Turn on Stay Connected") { task.end() }
+        Task { @MainActor in
+            await VPNQuickControl.wait(c, whileIn: [.connecting], upTo: 120)
+            self.refresh() // arms if it's up (statusChanged)
+            await self.lastQueued?.value
+            task.end()
+        }
+    }
+
+    /// A background task that ends once, whichever ends it first: the work or iOS.
+    @MainActor
+    private final class BackgroundTask {
+        var id = UIBackgroundTaskIdentifier.invalid
+        func end() {
+            guard id != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(id)
+            id = .invalid
+        }
     }
 
     /// Whether Connect should go ahead. Not if the VPN is up, or our own login is

@@ -32,7 +32,9 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
   reach the server for 30 minutes on a working network). Meanwhile traffic waits rather
   than bypassing the VPN. If the server gives the phone a new VPN address when it
   reconnects, the tunnel switches to it instead of disconnecting.
-- **Activity** in the app shows what the VPN did recently and why it stopped, if it did.
+- **Activity** in the app shows what the VPN did recently and why it stopped, if it did,
+  including when iOS ended the VPN extension without stopping it. Share it from there
+  when reporting a problem.
 - **Full tunnel**, like NYU's Cisco setup. IPv6 is dropped rather than bypassing the VPN.
 
 ## How it works

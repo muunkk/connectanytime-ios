@@ -34,7 +34,10 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
                      ocb_event_fn event, void *ctx);
 
 /// Logs in (username, password, then second password for Duo) and opens the
-/// VPN session. Blocks until Duo is approved or rejected. 0 on success.
+/// VPN session. Blocks until Duo is approved or rejected. 0 on success,
+/// OCB_UNREACHABLE if it failed before sending the password (so no Duo push was
+/// sent and trying again is safe), any other negative value on other failures.
+#define OCB_UNREACHABLE (-3)
 int ocb_connect(ocb_session *s, char *err, size_t errlen);
 
 /// Rejoins the session from an earlier login instead of logging in: no password,
