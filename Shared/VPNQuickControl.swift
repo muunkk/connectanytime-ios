@@ -125,8 +125,8 @@ enum VPNQuickControl {
     }
 
     /// Whether Stay Connected may be turned on in `status`: connected, or reconnecting a
-    /// session it has (e.g. a Connect that came up on the last settings while the server
-    /// can't be reached). Not while connecting: a login may be waiting for Duo.
+    /// session it has (e.g. the network changed just as the login finished). Not while
+    /// connecting: a login may be waiting for Duo.
     static func mayArm(_ status: NEVPNStatus) -> Bool {
         status == .connected || status == .reasserting && SavedSessionItem.exists
     }

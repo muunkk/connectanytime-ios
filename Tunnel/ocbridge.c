@@ -30,7 +30,6 @@ struct ocb_session {
     int login_state;
     char auth_error[512];
     char first_error[256]; // OpenConnect's first error in ocb_connect, to say why it failed
-    bool refused; // the server answered a rejoin with an HTTP error (see ocb_resume)
     char *connect_url;
     char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
 };
@@ -63,8 +62,6 @@ static void progress_cb(void *priv, int level, const char *fmt, ...) {
     else if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
                           !strncmp(fmt, "sleep %ds", 9)))
         s->event(s->ctx, OCB_RECONNECTING, NULL);
-    // The server answered a CONNECT with an HTTP error (see ocb_resume).
-    if (!strncmp(fmt, "Got inappropriate HTTP CONNECT response", 39)) s->refused = true;
     if (level > PRG_INFO) return;
     char buf[1024];
     va_list ap;
@@ -286,22 +283,13 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
         s->pin_ip = bracketed ? strndup(ip + 1, n - 2) : strdup(ip);
         openconnect_override_getaddrinfo(s->vpn, pinned_getaddrinfo);
     }
-    s->refused = false;
     int ret = openconnect_make_cstp_connection(s->vpn);
     if (ret) {
-        // The server answers 401 to a session it has ended (EPERM). Another HTTP error
-        // means it answered but wouldn't take the session (not a 503, which is just
-        // busy); anything else is a failure to reach it.
-        if (ret == -EPERM) {
-            snprintf(err, errlen, "The VPN session has ended.");
-            return OCB_SESSION_ENDED;
-        }
-        if (s->refused) {
-            snprintf(err, errlen, "The VPN server wouldn't rejoin the session.");
-            return OCB_REFUSED;
-        }
-        snprintf(err, errlen, "Couldn't reach the VPN server.");
-        return -1;
+        // The server answers 401 to a session it has ended (EPERM); anything else
+        // is a failure to reach it.
+        snprintf(err, errlen, ret == -EPERM ? "The VPN session has ended."
+                                             : "Couldn't reach the VPN server.");
+        return ret == -EPERM ? OCB_SESSION_ENDED : -1;
     }
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
