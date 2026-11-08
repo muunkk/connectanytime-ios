@@ -14,6 +14,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var _logOutOnStop = false
     /// The rejoin under way, so a timer can abort it if it hangs (under sessionLock).
     private var _resumeToken: UUID?
+    /// Likewise the login under way, until it sends the password (see connectWithDeadline).
+    private var _loginToken: UUID?
     /// Set by stopTunnel on iOS's thread, read on `queue`.
     private var stopping: Bool { sessionLock.withLock { _stopping } }
     private var pathMonitor: NWPathMonitor?
@@ -120,6 +122,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             }
 
             if session == nil {
+                // Started before the first unlock after a restart: the saved session can't
+                // be read yet, which doesn't mean it's gone. iOS starts it again later.
+                if saved == nil, KeychainItem.isLocked(SavedSessionItem.account) {
+                    return done(self.failure("Unlock your iPhone to reconnect the VPN."))
+                }
                 if let refusal = Self.loginRefusal(manual: manual) { return done(self.failure(refusal)) }
                 guard let password = SharedKeychain.read() else {
                     return done(self.failure("Open ConnectAnytime and save your password."))
@@ -131,7 +138,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     guard let s = self.newSession(server: server, user: user, password: password) else {
                         return done(self.failure(self.stopping ? "Cancelled." : "Couldn't start the VPN client."))
                     }
-                    let result = ocb_connect(s, &err, err.count)
+                    let result = self.connectWithDeadline(s, err: &err)
                     if result == 0 {
                         session = s
                         break
@@ -178,7 +185,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     return done(self.failure("Couldn't find the tunnel interface."))
                 }
                 self.log("Connected")
-                if !self.stopping { RunMarker.set() }
+                self.sessionLock.withLock { if !self._stopping { RunMarker.set() } } // see stopTunnel
                 done(nil)
                 self.queue.async {
                     self.tunFD = fd
@@ -199,9 +206,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             _stopping = true
             _logOutOnStop = logOut
             if let s = session { logOut ? ocb_cancel(s) : ocb_detach(s) }
+            RunMarker.clear() // under the lock, so startTunnel can't set it again after
         }
         if logOut { SessionStore.clear() }
-        RunMarker.clear()
         ActivityLog.flush()
         completionHandler()
         VPNQuickControl.reloadControl()
@@ -278,6 +285,27 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         log("Couldn't rejoin the session: \(String(cString: err))")
         freeSession()
         return (nil, result)
+    }
+
+    /// Logs in on `s` (ocb_connect). Reaching the server has no timeout of its own, and a
+    /// network that drops traffic, say a hotspot whose phone has no signal, would hang it
+    /// until you tap Disconnect. So it's aborted if it hasn't sent the password within
+    /// 20 s, failing with OCB_UNREACHABLE (safe to retry); once the password is sent it
+    /// runs on, since the server is then waiting for Duo. Blocks; call on `queue`.
+    private func connectWithDeadline(_ s: OpaquePointer, err: inout [CChar]) -> Int32 {
+        let token = UUID()
+        sessionLock.withLock { _loginToken = token }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 20) { [weak self] in
+            guard let self else { return }
+            let aborted = self.sessionLock.withLock {
+                guard self._loginToken == token, let s = self.session else { return false }
+                return ocb_cancel_unless_answered(s)
+            }
+            if aborted { self.log("The VPN server didn't answer within 20 s") }
+        }
+        let result = ocb_connect(s, &err, err.count)
+        sessionLock.withLock { _loginToken = nil }
+        return result
     }
 
     /// Waits, returning early (false) if the tunnel is stopping.
@@ -423,6 +451,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         reconnecting()
         lastRejoin = Date()
         guard let saved = savedSession() else {
+            // Can't read it before the first unlock after a restart; it may still be valid.
+            if KeychainItem.isLocked(SavedSessionItem.account) { return scheduleRejoin() }
             return end("The VPN session has ended. Tap Connect in ConnectAnytime to log in again.")
         }
         var err = [CChar](repeating: 0, count: 512)

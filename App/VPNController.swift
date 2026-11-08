@@ -107,12 +107,14 @@ final class VPNController: ObservableObject {
     /// leaving the app, for the Duo app or its notification, and iOS suspends the app
     /// soon after; it would then miss the VPN coming up, and Stay Connected would stay
     /// off until you next opened the app, so a drop meanwhile would leave the VPN off.
-    /// Background time lets it see the login through (iOS allows about 30 s).
+    /// Background time lets it see the login through. iOS allows about 30 s; after a
+    /// slower approval it's armed the next time the app opens, as before.
     private func armWhenConnected(_ c: NEVPNConnection) {
         let app = UIApplication.shared
         let task = BackgroundTask()
         task.id = app.beginBackgroundTask(withName: "Turn on Stay Connected") { task.end() }
         Task { @MainActor in
+            await VPNQuickControl.wait(c, whileIn: [.disconnected, .invalid], upTo: 5) // iOS can be slow to report it
             await VPNQuickControl.wait(c, whileIn: [.connecting], upTo: 120)
             self.refresh() // arms if it's up (statusChanged)
             await self.lastQueued?.value

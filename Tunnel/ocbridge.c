@@ -102,7 +102,7 @@ static int auth_form_cb(void *priv, struct oc_auth_form *form) {
                      form->error ? form->error : "");
             return OC_FORM_RESULT_CANCELLED;
         }
-        *answered = true;
+        __atomic_store_n(answered, true, __ATOMIC_SEQ_CST); // read by ocb_cancel_unless_answered
         openconnect_set_option_value(opt, value);
         logf_(s, PRG_INFO, "Answered %s", what);
         if (value == s->second) logf_(s, PRG_INFO, "Waiting for Duo approval…");
@@ -163,9 +163,10 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     static bool ssl_ready = false;
     if (!ssl_ready) {
         // A write to a connection the server or the network has reset raises SIGPIPE,
-        // which would kill the extension and drop the VPN. OpenSSL and OpenConnect write
-        // with plain send(), and only OpenConnect's command-line tool ignores it, so do
-        // it here: the write fails with EPIPE instead, and the reconnect logic handles it.
+        // which would kill the extension and drop the VPN. OpenSSL writes with plain
+        // write() and OpenConnect with send(), neither with SIGPIPE turned off, and only
+        // OpenConnect's command-line tool ignores it. So do it here: the write fails with
+        // EPIPE instead, and OpenConnect reconnects as for any other failed write.
         signal(SIGPIPE, SIG_IGN);
         openconnect_init_ssl();
         ssl_ready = true;
@@ -380,6 +381,13 @@ void ocb_reconnect(ocb_session *s) {
 void ocb_cancel(ocb_session *s) {
     char cmd = OC_CMD_CANCEL;
     if (s && s->cmd_fd >= 0) (void)!write(s->cmd_fd, &cmd, 1);
+}
+
+bool ocb_cancel_unless_answered(ocb_session *s) {
+    if (!s || __atomic_load_n(&s->answered_password, __ATOMIC_SEQ_CST) ||
+        __atomic_load_n(&s->answered_second, __ATOMIC_SEQ_CST)) return false;
+    ocb_cancel(s);
+    return true;
 }
 
 void ocb_detach(ocb_session *s) {

@@ -77,6 +77,13 @@ enum KeychainItem {
     static func delete(_ account: String) {
         SecItemDelete(base(account) as CFDictionary)
     }
+
+    /// Whether the Keychain can't be read yet because the iPhone hasn't been unlocked
+    /// since it started (e.g. after an overnight update), as opposed to there being no
+    /// such item. Items here are readable from the first unlock on.
+    static func isLocked(_ account: String) -> Bool {
+        SecItemCopyMatching(base(account) as CFDictionary, nil) == errSecInteractionNotAllowed
+    }
 }
 
 /// The VPN's recent activity (connects, network changes, reconnects, and why it
