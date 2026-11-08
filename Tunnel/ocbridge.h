@@ -75,7 +75,7 @@ void ocb_cancel(ocb_session *s);
 
 /// Thread-safe: aborts ocb_connect if it hasn't started sending the password yet, e.g.
 /// because it's stuck reaching the server; it then returns OCB_UNREACHABLE and sends
-/// nothing. A login that has started sending it (and so may send a Duo push) is left
+/// no password or Duo answer. A login that has started sending it (and so may send a Duo push) is left
 /// to finish. Returns whether it aborted. Call again until ocb_connect returns: a
 /// single cancel may only end the attempt on one of the server's addresses.
 bool ocb_cancel_unless_answered(ocb_session *s);

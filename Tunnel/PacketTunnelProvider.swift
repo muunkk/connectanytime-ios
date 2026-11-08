@@ -14,8 +14,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var _logOutOnStop = false
     /// The rejoin under way, so a timer can abort it if it hangs (under sessionLock).
     private var _resumeToken: UUID?
-    /// Likewise the login under way, until it sends the password (see connectWithDeadline).
+    /// Likewise the login under way (see connectWithDeadline), and whether it ran out of time.
     private var _loginToken: UUID?
+    private var _loginTimedOut = false
     /// Set by stopTunnel on iOS's thread, read on `queue`.
     private var stopping: Bool { sessionLock.withLock { _stopping } }
     private var pathMonitor: NWPathMonitor?
@@ -138,13 +139,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     guard let s = self.newSession(server: server, user: user, password: password) else {
                         return done(self.failure(self.stopping ? "Cancelled." : "Couldn't start the VPN client."))
                     }
-                    let result = self.connectWithDeadline(s, err: &err)
+                    let (result, timedOut) = self.connectWithDeadline(s, err: &err)
                     if result == 0 {
                         session = s
                         break
                     }
                     self.finishSession()
                     if self.stopping { return done(self.failure("Cancelled.")) }
+                    if timedOut {
+                        return done(self.failure("The VPN server stopped answering during the login. Tap Connect to try again."))
+                    }
                     let message = String(cString: err)
                     guard result == OCB_UNREACHABLE, attempt < 3 else { return done(self.failure(message)) }
                     self.log("\(message) Trying again")
@@ -290,30 +294,46 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// Logs in on `s` (ocb_connect). Reaching the server has no timeout of its own, and a
     /// network that drops traffic, say a hotspot whose phone has no signal, would hang it
     /// until you tap Disconnect. So it's aborted if it hasn't sent the password within
-    /// 20 s, failing with OCB_UNREACHABLE (safe to retry); once the password is sent it
-    /// runs on, since the server is then waiting for Duo. Blocks; call on `queue`.
-    private func connectWithDeadline(_ s: OpaquePointer, err: inout [CChar]) -> Int32 {
+    /// 20 s, failing with OCB_UNREACHABLE (safe to retry). Once the password is sent the
+    /// server waits for Duo, which gives up after about a minute, so it's only aborted
+    /// after 3 minutes; `timedOut` is then true, and it mustn't be retried: that would
+    /// send another Duo push. Blocks; call on `queue`.
+    private func connectWithDeadline(_ s: OpaquePointer, err: inout [CChar]) -> (Int32, timedOut: Bool) {
         let token = UUID()
-        sessionLock.withLock { _loginToken = token }
+        sessionLock.withLock { _loginToken = token; _loginTimedOut = false }
+        let start = DispatchTime.now()
         // After 20 s, and every second after that until ocb_connect returns.
         let timer = DispatchSource.makeTimerSource(queue: .global())
-        timer.schedule(deadline: .now() + 20, repeating: 1)
+        timer.schedule(deadline: start + 20, repeating: 1)
         var logged = false
         timer.setEventHandler { [weak self] in
             guard let self else { return timer.cancel() }
-            let aborted = self.sessionLock.withLock {
-                guard self._loginToken == token, let s = self.session else { return false }
-                return ocb_cancel_unless_answered(s)
+            let late = DispatchTime.now() >= start + 180
+            let (current, aborted) = self.sessionLock.withLock {
+                guard self._loginToken == token, let s = self.session else { return (false, false) }
+                if ocb_cancel_unless_answered(s) { return (true, true) } // password not sent
+                if late, !self._loginTimedOut {
+                    self._loginTimedOut = true
+                    ocb_cancel(s) // no cookie yet, so nothing to log out of
+                }
+                return (true, false)
             }
-            if !aborted { return timer.cancel() } // finished, or sending the password
-            if !logged { self.log("The VPN server didn't answer within 20 s") }
-            logged = true
+            guard current else { return timer.cancel() } // ocb_connect returned
+            if aborted, !logged {
+                self.log("The VPN server didn't answer within 20 s")
+                logged = true
+            }
+            if late { timer.cancel() }
         }
         timer.resume()
         defer { timer.cancel() }
         let result = ocb_connect(s, &err, err.count)
-        sessionLock.withLock { _loginToken = nil }
-        return result
+        let timedOut = sessionLock.withLock {
+            _loginToken = nil
+            return _loginTimedOut
+        }
+        if timedOut { log("No answer from the VPN server for 3 minutes during the login") }
+        return (result, timedOut && result != 0)
     }
 
     /// Waits, returning early (false) if the tunnel is stopping.
