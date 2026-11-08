@@ -259,9 +259,17 @@ static int pinned_getaddrinfo(void *priv, const char *node, const char *service,
     int pinned_err = getaddrinfo(s->pin_ip, service, hints, &pinned);
     int normal_err = getaddrinfo(node, service, hints, &normal);
     if (pinned_err) { *res = normal; return normal_err; }
+    // For the Activity log: falling back to the saved address is otherwise silent.
+    if (normal_err)
+        logf_(s, PRG_INFO, "Looking up %s failed (%s); trying the saved address", node, gai_strerror(normal_err));
     bool usable = normal_err != 0;
     for (struct addrinfo *a = normal_err ? NULL : normal; a && !usable; a = a->ai_next)
         usable = a->ai_addrlen == pinned->ai_addrlen && !memcmp(a->ai_addr, pinned->ai_addr, a->ai_addrlen);
+    if (!usable) {
+        char host[80] = "?";
+        getnameinfo(normal->ai_addr, normal->ai_addrlen, host, sizeof host, NULL, 0, NI_NUMERICHOST);
+        logf_(s, PRG_INFO, "This network gives %s for %s, not the saved address", host, node);
+    }
     if (!usable) { struct addrinfo *t = pinned; pinned = normal; normal = t; } // normal answers first
     struct addrinfo *tail = pinned;
     while (tail->ai_next) tail = tail->ai_next;
