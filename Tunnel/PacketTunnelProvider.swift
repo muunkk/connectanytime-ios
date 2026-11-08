@@ -274,15 +274,24 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let s = newSession(server: server, user: user, password: "") else { return (nil, -1) }
         let token = UUID()
         sessionLock.withLock { _resumeToken = token }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 30) { [weak self] in
-            guard let self else { return }
+        // After 30 s, and every second after that until ocb_resume returns: one abort may
+        // only end the attempt on one of the server's addresses (see connectWithDeadline).
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + 30, repeating: 1)
+        var logged = false
+        timer.setEventHandler { [weak self] in
+            guard let self else { return timer.cancel() }
             let stuck = self.sessionLock.withLock {
                 guard self._resumeToken == token, let s = self.session else { return false }
                 ocb_detach(s) // fails the attempt, leaving the server's session open
                 return true
             }
-            if stuck { self.log("Rejoining is taking too long; giving up on this attempt") }
+            guard stuck else { return timer.cancel() }
+            if !logged { self.log("Rejoining is taking too long; giving up on this attempt") }
+            logged = true
         }
+        timer.resume()
+        defer { timer.cancel() }
         let result = ocb_resume(s, saved.url, saved.cookie, saved.dnsName, saved.ip, &err, err.count)
         sessionLock.withLock { _resumeToken = nil }
         if result == 0 { return (s, 0) }
