@@ -141,9 +141,15 @@ final class VPNController: ObservableObject {
         try? await m.loadFromPreferences()
         switch m.connection.status {
         case .connected, .reasserting: return false
-        // iOS's automatic attempt rejoining a session: let it be. Stopping it counts as
-        // you turning the VPN off, which logs out, so you'd need Duo again.
-        case .connecting: return m.isOnDemandEnabled && !SavedSessionItem.exists
+        case .connecting:
+            guard m.isOnDemandEnabled else { return false } // our own login, waiting for Duo
+            guard SavedSessionItem.exists else { return true } // can only fail: take over
+            // iOS's automatic attempt rejoining a session: let it finish. Stopping it counts
+            // as you turning the VPN off, which logs out, so you'd need Duo again. If it
+            // finds the session over, log in, as you asked.
+            await VPNQuickControl.wait(m.connection, whileIn: [.connecting], upTo: 45, untilDisconnected: true)
+            return [.disconnected, .invalid].contains(m.connection.status)
+                && !SavedSessionItem.exists && !ConnectIntent.disconnected
         default: return true
         }
     }

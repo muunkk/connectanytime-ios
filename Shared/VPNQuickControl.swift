@@ -42,8 +42,10 @@ enum VPNQuickControl {
             // iOS's automatic attempt is rejoining a session: leave it be. Stopping it would
             // mean a second push, or log out a session that's still there.
             if c.status == .connecting, !m.isOnDemandEnabled || SavedSessionItem.exists {
-                await wait(c, whileIn: [.connecting], upTo: 90)
-                return await armIfConnected(m)
+                await wait(c, whileIn: [.connecting], upTo: 90, untilDisconnected: true)
+                // Unless the rejoin found the session over: then log in, as you asked.
+                let over = m.isOnDemandEnabled && [.disconnected, .invalid].contains(c.status) && !SavedSessionItem.exists
+                if !over || ConnectIntent.disconnected { return await armIfConnected(m) }
             }
             // iOS disables this configuration whenever another VPN is used. The app's
             // Connect re-enables it on every save; the toggle has to as well.
