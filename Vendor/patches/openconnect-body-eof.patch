@@ -1,0 +1,30 @@
+--- a/http.c
++++ b/http.c
+@@ -410,10 +410,12 @@
+ 
+ 		while (body->pos < bodylen) {
+ 			i = vpninfo->ssl_read(vpninfo, body->data + body->pos, bodylen - body->pos);
+-			if (i < 0) {
++			if (i <= 0) {
++				/* 0: the server closed the connection before the end of the
++				 * body. Without this the loop would spin forever. */
+ 				vpn_progress(vpninfo, PRG_ERR,
+ 					     _("Error reading HTTP response body\n"));
+-				ret = i;
++				ret = i ?: -EIO;
+ 				goto err;
+ 			}
+ 			body->pos += i;
+@@ -467,10 +469,10 @@
+ 			}
+ 			while (chunklen) {
+ 				i = vpninfo->ssl_read(vpninfo, body->data + body->pos, chunklen);
+-				if (i < 0) {
++				if (i <= 0) { /* 0: closed mid-chunk, as above */
+ 					vpn_progress(vpninfo, PRG_ERR,
+ 						     _("Error reading HTTP response body\n"));
+-					ret = i;
++					ret = i ?: -EIO;
+ 					goto err;
+ 				}
+ 				chunklen -= i;
