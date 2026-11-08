@@ -179,6 +179,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let key = String(cString: cfg.key)
             ocb_config_free(&cfg)
 
+            self.log("Tunnel settings: \(Self.describe(settings))")
             self.setTunnelNetworkSettings(settings) { error in
                 self.queue.async { if error == nil { self.installedKey = key } }
                 if let error {
@@ -413,6 +414,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    /// What a network looks like, for the Activity log: interface, gateways, and which
+    /// IP versions and DNS it offers (an IPv6-only one means NAT64).
+    private static func describe(_ path: Network.NWPath) -> String {
+        let ip = [path.supportsIPv4 ? "IPv4" : nil, path.supportsIPv6 ? "IPv6" : nil].compactMap { $0 }
+        return ([path.availableInterfaces.first?.name ?? "?"] + path.gateways.map { "via \($0)" }
+            + [ip.isEmpty ? "no IP" : ip.joined(separator: "+"), path.supportsDNS ? "DNS" : "no DNS"]
+            + (path.isExpensive ? ["expensive"] : []) + (path.isConstrained ? ["low data"] : []))
+            .joined(separator: ", ")
+    }
+
+    /// The tunnel's address and MTU, for the Activity log.
+    private static func describe(_ settings: NEPacketTunnelNetworkSettings) -> String {
+        let v4 = settings.ipv4Settings.map { zip($0.addresses, $0.subnetMasks).map { "\($0)/\($1)" } } ?? []
+        return "address \(v4.joined(separator: " ")), MTU \(settings.mtu.map { "\($0)" } ?? "default")"
+    }
+
     /// Frees the OpenConnect session, leaving the tunnel up.
     private func freeSession() {
         sessionLock.withLock {
@@ -542,7 +559,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 : ([path.availableInterfaces.first?.name ?? ""] + path.gateways.map { "\($0)" }.sorted()).joined(separator: ",")
             defer { self.lastNetwork = network }
             guard let last = self.lastNetwork, last != network else { return }
-            self.log(network == "offline" ? "Network lost" : "Network changed (\(Self.describe(path.availableInterfaces.first?.type)))")
+            self.log(network == "offline" ? "Network lost" : "Network changed (\(Self.describe(path.availableInterfaces.first?.type)): \(Self.describe(path)))")
             self.reconnecting()
             guard network != "offline" else { return }
             // Path updates come in bursts (interface, then gateways); reconnect once,
@@ -611,7 +628,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             wanted = nil
             return finishReconnect(epoch: want.epoch)
         }
-        log("Applying new tunnel settings from the server")
+        log("Applying new tunnel settings from the server: \(Self.describe(want.settings))")
         applyingSettings = true
         setTunnelNetworkSettings(want.settings) { error in
             self.queue.async {
