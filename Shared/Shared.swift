@@ -82,7 +82,11 @@ enum KeychainItem {
     /// since it started (e.g. after an overnight update), as opposed to there being no
     /// such item. Items here are readable from the first unlock on.
     static func isLocked(_ account: String) -> Bool {
-        SecItemCopyMatching(base(account) as CFDictionary, nil) == errSecInteractionNotAllowed
+        var q = base(account)
+        q[kSecReturnAttributes as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: AnyObject?
+        return SecItemCopyMatching(q as CFDictionary, &out) == errSecInteractionNotAllowed
     }
 }
 

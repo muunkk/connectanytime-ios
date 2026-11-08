@@ -24,11 +24,17 @@ struct ocb_session {
     ocb_event_fn event;
     void *ctx;
     bool answered_user, answered_password, answered_second;
+    // Whether the login has started sending secrets, or been aborted for taking too long
+    // before it did. Changed only by compare-and-swap from LOGIN_IDLE, so exactly one of
+    // the two happens (see ocb_cancel_unless_answered).
+    int login_state;
     char auth_error[512];
     char first_error[256]; // OpenConnect's first error in ocb_connect, to say why it failed
     char *connect_url;
     char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
 };
+
+enum { LOGIN_IDLE, LOGIN_SENDING_SECRETS, LOGIN_ABORTED };
 
 static void reconnected_cb(void *priv);
 
@@ -102,7 +108,16 @@ static int auth_form_cb(void *priv, struct oc_auth_form *form) {
                      form->error ? form->error : "");
             return OC_FORM_RESULT_CANCELLED;
         }
-        __atomic_store_n(answered, true, __ATOMIC_SEQ_CST); // read by ocb_cancel_unless_answered
+        if (value != s->user) {
+            // About to send the password or the Duo answer: claim the login, unless the
+            // deadline already aborted it, in which case send nothing.
+            int idle = LOGIN_IDLE;
+            if (!__atomic_compare_exchange_n(&s->login_state, &idle, LOGIN_SENDING_SECRETS, false,
+                                             __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) &&
+                idle != LOGIN_SENDING_SECRETS)
+                return OC_FORM_RESULT_CANCELLED;
+        }
+        *answered = true;
         openconnect_set_option_value(opt, value);
         logf_(s, PRG_INFO, "Answered %s", what);
         if (value == s->second) logf_(s, PRG_INFO, "Waiting for Duo approval…");
@@ -203,7 +218,12 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         }
         // Nothing secret sent yet, so no Duo push and nothing to lock the account:
         // the network didn't get us to the login form. Safe to try again.
-        if (!s->answered_password && !s->answered_second) {
+        int state = __atomic_load_n(&s->login_state, __ATOMIC_SEQ_CST);
+        if (state == LOGIN_ABORTED) {
+            snprintf(err, errlen, "Couldn't reach the VPN server on this network (no answer in 20 s).");
+            return OCB_UNREACHABLE;
+        }
+        if (state == LOGIN_IDLE) {
             snprintf(err, errlen, "Couldn't reach the VPN server on this network%s%s%s",
                      s->first_error[0] ? " (" : "", s->first_error, s->first_error[0] ? ")." : ".");
             return OCB_UNREACHABLE;
@@ -384,8 +404,14 @@ void ocb_cancel(ocb_session *s) {
 }
 
 bool ocb_cancel_unless_answered(ocb_session *s) {
-    if (!s || __atomic_load_n(&s->answered_password, __ATOMIC_SEQ_CST) ||
-        __atomic_load_n(&s->answered_second, __ATOMIC_SEQ_CST)) return false;
+    if (!s) return false;
+    int idle = LOGIN_IDLE;
+    if (!__atomic_compare_exchange_n(&s->login_state, &idle, LOGIN_ABORTED, false,
+                                     __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) &&
+        idle != LOGIN_ABORTED)
+        return false; // the password is on its way: let the login finish
+    // Again on every call: OpenConnect only notices a cancel when it's waiting on the
+    // socket, and after one it can go on to try the server's next address.
     ocb_cancel(s);
     return true;
 }

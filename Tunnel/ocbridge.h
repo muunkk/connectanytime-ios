@@ -73,10 +73,11 @@ void ocb_reconnect(ocb_session *s);
 /// Thread-safe: aborts ocb_connect or ocb_run, logging out of the server's session.
 void ocb_cancel(ocb_session *s);
 
-/// Thread-safe: aborts ocb_connect if it hasn't sent the password yet, e.g. because
-/// it's stuck reaching the server. It then returns OCB_UNREACHABLE. A login that has
-/// sent the password (and so may have sent a Duo push) is left to finish. Returns
-/// whether it aborted.
+/// Thread-safe: aborts ocb_connect if it hasn't started sending the password yet, e.g.
+/// because it's stuck reaching the server; it then returns OCB_UNREACHABLE and sends
+/// nothing. A login that has started sending it (and so may send a Duo push) is left
+/// to finish. Returns whether it aborted. Call again until ocb_connect returns: a
+/// single cancel may only end the attempt on one of the server's addresses.
 bool ocb_cancel_unless_answered(ocb_session *s);
 
 /// Thread-safe: like ocb_cancel, but leaves the server's session open, so

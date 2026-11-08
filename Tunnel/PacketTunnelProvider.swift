@@ -295,14 +295,22 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private func connectWithDeadline(_ s: OpaquePointer, err: inout [CChar]) -> Int32 {
         let token = UUID()
         sessionLock.withLock { _loginToken = token }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 20) { [weak self] in
-            guard let self else { return }
+        // After 20 s, and every second after that until ocb_connect returns.
+        let timer = DispatchSource.makeTimerSource(queue: .global())
+        timer.schedule(deadline: .now() + 20, repeating: 1)
+        var logged = false
+        timer.setEventHandler { [weak self] in
+            guard let self else { return timer.cancel() }
             let aborted = self.sessionLock.withLock {
                 guard self._loginToken == token, let s = self.session else { return false }
                 return ocb_cancel_unless_answered(s)
             }
-            if aborted { self.log("The VPN server didn't answer within 20 s") }
+            if !aborted { return timer.cancel() } // finished, or sending the password
+            if !logged { self.log("The VPN server didn't answer within 20 s") }
+            logged = true
         }
+        timer.resume()
+        defer { timer.cancel() }
         let result = ocb_connect(s, &err, err.count)
         sessionLock.withLock { _loginToken = nil }
         return result
