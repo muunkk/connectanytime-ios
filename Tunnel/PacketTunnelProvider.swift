@@ -92,6 +92,15 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             RunMarker.clear()
         }
         log("Connecting to \(server) (\(manual ? "manual" : "auto")\(saved != nil ? ", rejoining session" : ""))")
+        // The network it starts on, for the Activity log; watchNetwork only runs once
+        // the tunnel is up. Holds itself until its first update.
+        let probe = NWPathMonitor(prohibitedInterfaceTypes: [.other, .loopback])
+        probe.pathUpdateHandler = { [weak self] path in
+            probe.pathUpdateHandler = nil
+            probe.cancel()
+            self?.log("Network at start: \(Self.describe(path))")
+        }
+        probe.start(queue: .global(qos: .utility))
 
         queue.async {
             var err = [CChar](repeating: 0, count: 512)
