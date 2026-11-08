@@ -65,12 +65,21 @@ enum KeychainItem {
         return String(data: d, encoding: .utf8)
     }
 
+    /// Replaces the item in place, so a reader in another process never sees it missing
+    /// (e.g. the app deciding there's no session to rejoin), and a failed write keeps
+    /// the old value rather than losing it.
     @discardableResult
     static func save(_ value: String, as account: String) -> Bool {
-        delete(account)
+        let data = Data(value.utf8)
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let updated = SecItemUpdate(base(account) as CFDictionary, attributes as CFDictionary)
+        if updated == errSecSuccess { return true }
+        guard updated == errSecItemNotFound else { return false }
         var add = base(account)
-        add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        add.merge(attributes) { $1 }
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 

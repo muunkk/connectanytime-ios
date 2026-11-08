@@ -38,9 +38,10 @@ enum VPNQuickControl {
         defer { reloadControl() }
         ConnectIntent.set(disconnected: !on)
         if on {
-            // Our own login is already waiting for Duo (on-demand is off for those):
-            // leave it be, or stopping it would mean a second push.
-            if c.status == .connecting, !m.isOnDemandEnabled {
+            // Our own login is already waiting for Duo (on-demand is off for those), or
+            // iOS's automatic attempt is rejoining a session: leave it be. Stopping it would
+            // mean a second push, or log out a session that's still there.
+            if c.status == .connecting, !m.isOnDemandEnabled || SavedSessionItem.exists {
                 await wait(c, whileIn: [.connecting], upTo: 90)
                 return await armIfConnected(m)
             }

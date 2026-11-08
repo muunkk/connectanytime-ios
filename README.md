@@ -30,7 +30,9 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
   reconnects within seconds. It keeps trying through any number of network changes and
   any time offline, and only stops when you disconnect or the server says the session
   is over. If iOS restarts the VPN, it comes straight back up and rejoins the session in
-  the background. Meanwhile traffic waits rather
+  the background (with Stay Connected on, which is what lets iOS restart it). On a
+  network where the server can't be reached, such as one that wants you to log in on a
+  web page first, that means no internet until you disconnect. Meanwhile traffic waits rather
   than bypassing the VPN. If the server gives the phone a new VPN address when it
   reconnects, the tunnel switches to it instead of disconnecting.
 - **Activity** in the app shows what the VPN did recently and why it stopped, if it did,

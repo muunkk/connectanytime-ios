@@ -106,14 +106,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                         SessionStore.clear()
                         break
                     }
-                    if manual { break } // log in instead
                     // The server may well still have the session; it just can't be reached
                     // right now (no signal, a network still coming up). Like Cisco's client,
                     // stay on: bring the VPN up on the last settings, so traffic waits
                     // instead of going around it, and keep rejoining in the background.
+                    // Connect too: logging in again would mean another Duo push for a
+                    // session that's still there.
                     if let settings = saved.tunnelSettings, let key = saved.settingsKey {
                         return self.upWhileRejoining(settings, key: key, done: done)
                     }
+                    if saved.settings != nil { self.log("Couldn't read the saved tunnel settings") }
+                    if manual { break } // log in instead
                     // A session saved by an older build, without settings: keep it, and let
                     // iOS try again later.
                     guard attempt < 4, self.sleepUnlessStopping(Double(attempt) * 5) else {
