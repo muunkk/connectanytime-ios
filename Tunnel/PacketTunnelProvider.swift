@@ -438,7 +438,16 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// The tunnel's address and MTU, for the Activity log.
     private static func describe(_ settings: NEPacketTunnelNetworkSettings) -> String {
         let v4 = settings.ipv4Settings.map { zip($0.addresses, $0.subnetMasks).map { "\($0)/\($1)" } } ?? []
-        return "address \(v4.joined(separator: " ")), MTU \(settings.mtu.map { "\($0)" } ?? "default")"
+        // Routes and DNS too: a hotspot's 172.20.10.0/28 inside one would cut it off.
+        func routes(_ r: [NEIPv4Route]?) -> String {
+            let all = (r ?? []).map { "\($0.destinationAddress)/\($0.destinationSubnetMask)" }
+            if all.isEmpty { return "none" }
+            return all.prefix(8).joined(separator: " ") + (all.count > 8 ? " +\(all.count - 8) more" : "")
+        }
+        let dns = settings.dnsSettings.map { $0.servers.joined(separator: " ") } ?? "none"
+        return "address \(v4.joined(separator: " ")), routes \(routes(settings.ipv4Settings?.includedRoutes)),"
+            + " except \(routes(settings.ipv4Settings?.excludedRoutes)), DNS \(dns),"
+            + " MTU \(settings.mtu.map { "\($0)" } ?? "default")"
     }
 
     /// Frees the OpenConnect session, leaving the tunnel up.
