@@ -218,7 +218,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         // sleep, an update), leave the server's session open, like Cisco's client, so
         // the next start rejoins it without Duo.
         let logOut = Self.endsSession(reason)
-        log("Stopping (\(Self.describe(reason))\(logOut ? "" : ", keeping the session"))")
+        // Disconnect in the app or our Control Center tile marks itself first; iOS's own
+        // VPN switches (and a Connect taking over an automatic attempt) don't.
+        let by = reason == .userInitiated ? (ConnectIntent.disconnected ? " with Disconnect" : " by iOS or a new Connect") : ""
+        log("Stopping (\(Self.describe(reason))\(by)\(logOut ? "" : ", keeping the session"))")
         sessionLock.withLock {
             _stopping = true
             _logOutOnStop = logOut

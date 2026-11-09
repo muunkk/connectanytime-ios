@@ -80,8 +80,18 @@ enum VPNQuickControl {
             // Pause auto-connect so iOS doesn't reconnect straight away. Saved even if it
             // reads off, in case the app is turning it on right now. Best effort:
             // stopping matters more.
+            // In Activity, to tell a VPN that comes back on its own after this from a
+            // network that doesn't load without it. Flushed: this process can end any time.
+            ActivityLog.add("Control Center: turning the VPN off (\(describe(c.status)))")
             m.isOnDemandEnabled = false
-            try? await save(m, "pause auto-connect")
+            do {
+                try await save(m, "pause auto-connect")
+                ActivityLog.add(m.isOnDemandEnabled ? "Control Center: Stay Connected is still on"
+                                                    : "Control Center: paused Stay Connected")
+            } catch {
+                ActivityLog.add("Control Center: couldn't pause Stay Connected: \(error.localizedDescription)")
+            }
+            ActivityLog.flush()
             c.stopVPNTunnel()
             await wait(c, whileIn: [.connected, .connecting, .reasserting])
         }
