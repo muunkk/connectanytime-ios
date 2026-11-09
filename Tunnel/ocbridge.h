@@ -3,6 +3,7 @@
 #ifndef OCBRIDGE_H
 #define OCBRIDGE_H
 
+#include <stdbool.h>
 #include <stddef.h>
 
 typedef struct ocb_session ocb_session;
@@ -34,7 +35,10 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
                      ocb_event_fn event, void *ctx);
 
 /// Logs in (username, password, then second password for Duo) and opens the
-/// VPN session. Blocks until Duo is approved or rejected. 0 on success.
+/// VPN session. Blocks until Duo is approved or rejected. 0 on success,
+/// OCB_UNREACHABLE if it failed before sending the password (so no Duo push was
+/// sent and trying again is safe), any other negative value on other failures.
+#define OCB_UNREACHABLE (-3)
 int ocb_connect(ocb_session *s, char *err, size_t errlen);
 
 /// Rejoins the session from an earlier login instead of logging in: no password,
@@ -68,6 +72,13 @@ void ocb_reconnect(ocb_session *s);
 
 /// Thread-safe: aborts ocb_connect or ocb_run, logging out of the server's session.
 void ocb_cancel(ocb_session *s);
+
+/// Thread-safe: aborts ocb_connect if it hasn't started sending the password yet, e.g.
+/// because it's stuck reaching the server; it then returns OCB_UNREACHABLE and sends
+/// no password or Duo answer. A login that has started sending it (and so may send a Duo push) is left
+/// to finish. Returns whether it aborted. Call again until ocb_connect returns: a
+/// single cancel may only end the attempt on one of the server's addresses.
+bool ocb_cancel_unless_answered(ocb_session *s);
 
 /// Thread-safe: like ocb_cancel, but leaves the server's session open, so
 /// ocb_resume can rejoin it.

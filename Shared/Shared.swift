@@ -65,16 +65,73 @@ enum KeychainItem {
         return String(data: d, encoding: .utf8)
     }
 
+    /// Replaces the item in place, so a reader in another process never sees it missing
+    /// (e.g. the app deciding there's no session to rejoin), and a failed write keeps
+    /// the old value rather than losing it.
     @discardableResult
     static func save(_ value: String, as account: String) -> Bool {
-        delete(account)
+        let data = Data(value.utf8)
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly,
+        ]
+        let updated = SecItemUpdate(base(account) as CFDictionary, attributes as CFDictionary)
+        if updated == errSecSuccess { return true }
+        guard updated == errSecItemNotFound else { return false }
         var add = base(account)
-        add[kSecValueData as String] = Data(value.utf8)
-        add[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        add.merge(attributes) { $1 }
         return SecItemAdd(add as CFDictionary, nil) == errSecSuccess
     }
 
     static func delete(_ account: String) {
         SecItemDelete(base(account) as CFDictionary)
     }
+
+    /// Whether the Keychain can't be read yet because the iPhone hasn't been unlocked
+    /// since it started (e.g. after an overnight update), as opposed to there being no
+    /// such item. Items here are readable from the first unlock on.
+    static func isLocked(_ account: String) -> Bool {
+        var q = base(account)
+        q[kSecReturnAttributes as String] = true
+        q[kSecMatchLimit as String] = kSecMatchLimitOne
+        var out: AnyObject?
+        return SecItemCopyMatching(q as CFDictionary, &out) == errSecInteractionNotAllowed
+    }
+}
+
+/// The VPN's recent activity (connects, network changes, reconnects, and why it
+/// stopped), written by the tunnel so the app can show why it dropped. In the Keychain
+/// like the rest, since there's no shared app group. Holds OpenConnect's status lines
+/// and our own, never the password or the session cookie.
+enum ActivityLog {
+    private static let account = "activity"
+    private static let maxLines = 300
+    private static let writes = DispatchQueue(label: "connectanytime.activity", qos: .utility)
+    /// Lines not yet saved. Only touched on `writes`.
+    nonisolated(unsafe) private static var pending: [String] = []
+
+    /// Saved within a second, a burst of lines in one Keychain write.
+    static func add(_ line: String) {
+        let stamped = "\(Date().formatted(.dateTime.month(.twoDigits).day(.twoDigits).hour(.twoDigits(amPM: .omitted)).minute(.twoDigits).second(.twoDigits))) \(line)"
+        writes.async {
+            pending.append(stamped)
+            if pending.count == 1 { writes.asyncAfter(deadline: .now() + 1) { save() } }
+        }
+    }
+
+    /// Saves now, e.g. before the tunnel stops.
+    static func flush() { writes.sync { save() } }
+
+    private static func save() {
+        guard !pending.isEmpty else { return }
+        let lines = read() + pending
+        pending = []
+        KeychainItem.save(lines.suffix(maxLines).joined(separator: "\n"), as: account)
+    }
+
+    static func read() -> [String] {
+        (KeychainItem.read(account) ?? "").split(separator: "\n").map(String.init)
+    }
+
+    static func clear() { KeychainItem.delete(account) }
 }

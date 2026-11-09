@@ -104,6 +104,12 @@ struct ContentView: View {
                         .keyboardType(.URL)
                         .focused($focused)
                 }
+
+                Section {
+                    NavigationLink("Activity") { ActivityView() }
+                } footer: {
+                    Text("What the VPN did recently, such as reconnecting after a network change, and why it stopped.")
+                }
             }
             .navigationTitle("ConnectAnytime")
         }
@@ -129,5 +135,34 @@ struct ContentView: View {
         case .disconnecting: "Disconnecting…"
         default: "Not connected"
         }
+    }
+}
+
+/// The tunnel's recent activity, newest first.
+struct ActivityView: View {
+    @State private var lines: [String] = []
+
+    var body: some View {
+        List(lines.reversed().indices, id: \.self) { i in
+            Text(lines.reversed()[i])
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+        }
+        .overlay { if lines.isEmpty { ContentUnavailableView("No activity yet", systemImage: "list.bullet") } }
+        .navigationTitle("Activity")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                ShareLink(item: lines.joined(separator: "\n")) { Image(systemName: "square.and.arrow.up") }
+                    .disabled(lines.isEmpty)
+                Button("Clear") {
+                    ActivityLog.clear()
+                    lines = []
+                }
+                .disabled(lines.isEmpty)
+            }
+        }
+        .refreshable { lines = ActivityLog.read() }
+        .onAppear { lines = ActivityLog.read() }
     }
 }

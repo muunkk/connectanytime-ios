@@ -1,6 +1,7 @@
 import Foundation
 import NetworkExtension
 import SwiftUI
+import UIKit
 
 /// Owns the single VPN configuration and drives connect/disconnect.
 @MainActor
@@ -74,6 +75,7 @@ final class VPNController: ObservableObject {
         guard hasPassword else { return lastError = "Save your password first." }
         guard ![.connected, .reasserting].contains(status) else { return }
         ConnectIntent.set(disconnected: false)
+        var started: NEVPNConnection?
         await inOrder {
             guard let m = self.manager else { return }
             guard await self.mayStartLogin(m) else { return }
@@ -93,10 +95,42 @@ final class VPNController: ObservableObject {
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
                 // Until iOS reports the start, so a Connect queued behind this one sees it.
                 await VPNQuickControl.wait(m.connection, whileIn: [.disconnected, .invalid])
+                started = m.connection
             } catch {
                 self.lastError = error.localizedDescription
             }
         }.value
+        if let started { armWhenConnected(started) }
+    }
+
+    /// Turns Stay Connected on once this login is through. Approving Duo usually means
+    /// leaving the app, for the Duo app or its notification, and iOS suspends the app
+    /// soon after; it would then miss the VPN coming up, and Stay Connected would stay
+    /// off until you next opened the app, so a drop meanwhile would leave the VPN off.
+    /// Background time lets it see the login through. iOS allows about 30 s; after a
+    /// slower approval it's armed the next time the app opens, as before.
+    private func armWhenConnected(_ c: NEVPNConnection) {
+        let app = UIApplication.shared
+        let task = BackgroundTask()
+        task.id = app.beginBackgroundTask(withName: "Turn on Stay Connected") { task.end() }
+        Task { @MainActor in
+            await VPNQuickControl.wait(c, whileIn: [.disconnected, .invalid], upTo: 5) // iOS can be slow to report it
+            await VPNQuickControl.wait(c, whileIn: [.connecting], upTo: 120)
+            self.refresh() // arms if it's up (statusChanged)
+            await self.lastQueued?.value
+            task.end()
+        }
+    }
+
+    /// A background task that ends once, whichever ends it first: the work or iOS.
+    @MainActor
+    private final class BackgroundTask {
+        var id = UIBackgroundTaskIdentifier.invalid
+        func end() {
+            guard id != .invalid else { return }
+            UIApplication.shared.endBackgroundTask(id)
+            id = .invalid
+        }
     }
 
     /// Whether Connect should go ahead. Not if the VPN is up, or our own login is
@@ -107,7 +141,15 @@ final class VPNController: ObservableObject {
         try? await m.loadFromPreferences()
         switch m.connection.status {
         case .connected, .reasserting: return false
-        case .connecting: return m.isOnDemandEnabled
+        case .connecting:
+            guard m.isOnDemandEnabled else { return false } // our own login, waiting for Duo
+            guard SavedSessionItem.exists else { return true } // can only fail: take over
+            // iOS's automatic attempt rejoining a session: let it finish. Stopping it counts
+            // as you turning the VPN off, which logs out, so you'd need Duo again. If it
+            // finds the session over, log in, as you asked.
+            await VPNQuickControl.wait(m.connection, whileIn: [.connecting], upTo: 45, untilDisconnected: true)
+            return [.disconnected, .invalid].contains(m.connection.status)
+                && !SavedSessionItem.exists && !ConnectIntent.disconnected
         default: return true
         }
     }
@@ -247,7 +289,7 @@ final class VPNController: ObservableObject {
     /// another push. Not after a Disconnect (app or Control Center) until the next
     /// connect, even if a late status update still says connected.
     private func armOnDemandIfConnected() {
-        guard status == .connected, !ConnectIntent.disconnected, let m = manager else { return }
+        guard VPNQuickControl.mayArm(status), !ConnectIntent.disconnected, let m = manager else { return }
         inOrder { await VPNQuickControl.armIfConnected(m) }
     }
 
@@ -280,7 +322,7 @@ final class VPNController: ObservableObject {
             rulesSavePending = false
             inOrder { await self.applyOnDemand() }
         }
-        if status == .connected { armOnDemandIfConnected() }
+        if VPNQuickControl.mayArm(status) { armOnDemandIfConnected() }
         if [.disconnected, .connecting].contains(status) { disarmIfNothingToRejoin() }
         VPNQuickControl.reloadControl()
         if status == .disconnected, old != .disconnected {

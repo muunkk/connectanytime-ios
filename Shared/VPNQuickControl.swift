@@ -38,11 +38,14 @@ enum VPNQuickControl {
         defer { reloadControl() }
         ConnectIntent.set(disconnected: !on)
         if on {
-            // Our own login is already waiting for Duo (on-demand is off for those):
-            // leave it be, or stopping it would mean a second push.
-            if c.status == .connecting, !m.isOnDemandEnabled {
-                await wait(c, whileIn: [.connecting], upTo: 90)
-                return await armIfConnected(m)
+            // Our own login is already waiting for Duo (on-demand is off for those), or
+            // iOS's automatic attempt is rejoining a session: leave it be. Stopping it would
+            // mean a second push, or log out a session that's still there.
+            if c.status == .connecting, !m.isOnDemandEnabled || SavedSessionItem.exists {
+                await wait(c, whileIn: [.connecting], upTo: 90, untilDisconnected: true)
+                // Unless the rejoin found the session over: then log in, as you asked.
+                let over = m.isOnDemandEnabled && [.disconnected, .invalid].contains(c.status) && !SavedSessionItem.exists
+                if !over || ConnectIntent.disconnected { return await armIfConnected(m) }
             }
             // iOS disables this configuration whenever another VPN is used. The app's
             // Connect re-enables it on every save; the toggle has to as well.
@@ -101,7 +104,7 @@ enum VPNQuickControl {
     /// Never after a Disconnect, from the app or Control Center, until the next connect.
     static func armIfConnected(_ m: NETunnelProviderManager) async {
         try? await m.loadFromPreferences()
-        guard m.connection.status == .connected, !m.isOnDemandEnabled,
+        guard mayArm(m.connection.status), !m.isOnDemandEnabled,
               !(m.onDemandRules ?? []).isEmpty, !ConnectIntent.disconnected else { return }
         m.isOnDemandEnabled = true
         guard (try? await m.saveToPreferences()) != nil else { return }
@@ -109,12 +112,23 @@ enum VPNQuickControl {
         // disconnected meanwhile, or a new login started, don't leave it on. (Rolling
         // back saves the configuration, so a login started in the same instant could
         // see one save mid-connect; that takes a tap within a moment of this one.)
-        if ConnectIntent.disconnected || ![.connected, .reasserting].contains(m.connection.status) {
+        // Not just because the VPN dropped meanwhile: with a session to rejoin, that's
+        // when it's needed, to bring it back. A new login only runs without one.
+        let status = m.connection.status
+        let newLogin = [.connecting, .disconnected, .invalid].contains(status) && !SavedSessionItem.exists
+        if ConnectIntent.disconnected || newLogin {
             logger.log("Disconnected while turning auto-connect on; turning it off again")
             try? await m.loadFromPreferences()
             m.isOnDemandEnabled = false
             try? await m.saveToPreferences()
         }
+    }
+
+    /// Whether Stay Connected may be turned on in `status`: connected, or reconnecting a
+    /// session it has (e.g. the network changed just as the login finished). Not while
+    /// connecting: a login may be waiting for Duo.
+    static func mayArm(_ status: NEVPNStatus) -> Bool {
+        status == .connected || status == .reasserting && SavedSessionItem.exists
     }
 
     /// Lets an attempt already under way (iOS's automatic one) finish, for up to 10 s,

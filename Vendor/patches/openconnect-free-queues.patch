@@ -1,0 +1,17 @@
+--- a/library.c
++++ b/library.c
+@@ -933,6 +933,14 @@
+ 	free_pkt(vpninfo, vpninfo->dtls_pkt);
+ 	free_pkt(vpninfo, vpninfo->cstp_pkt);
+ 	struct pkt *pkt;
++	/* Packets still queued when the session is freed. A long-lived caller that
++	 * replaces sessions (e.g. rejoining after the connection ends) would leak them. */
++	while ((pkt = dequeue_packet(&vpninfo->incoming_queue)))
++		free(pkt);
++	while ((pkt = dequeue_packet(&vpninfo->outgoing_queue)))
++		free(pkt);
++	while ((pkt = dequeue_packet(&vpninfo->tcp_control_queue)))
++		free(pkt);
+ 	while ((pkt = dequeue_packet(&vpninfo->free_queue)))
+ 		free(pkt);
+ 
