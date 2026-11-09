@@ -1,0 +1,61 @@
+--- a/ssl.c
++++ b/ssl.c
+@@ -89,7 +89,14 @@
+ 	fd_set wr_set, rd_set, ex_set;
+ 	int maxfd = sockfd;
+ 	int err;
++#ifdef __APPLE__
++	/* For a log line on failure: where the connect went out from, and how fast it failed. */
++	char local[NI_MAXHOST] = "unknown";
++	struct timespec started;
+ 
++	clock_gettime(CLOCK_MONOTONIC, &started);
++#endif
++
+ 	if (set_sock_nonblock(sockfd))
+ 		goto sockerr;
+ 
+@@ -105,6 +112,16 @@
+ #endif
+ 	}
+ 
++#ifdef __APPLE__
++	{
++		struct sockaddr_storage la;
++		socklen_t lalen = sizeof(la);
++
++		if (!getsockname(sockfd, (void *)&la, &lalen))
++			getnameinfo((void *)&la, lalen, local, sizeof(local), NULL, 0, NI_NUMERICHOST);
++	}
++#endif
++
+ 	do {
+ 		FD_ZERO(&wr_set);
+ 		FD_ZERO(&rd_set);
+@@ -146,6 +163,26 @@
+ 	}
+ #else
+ 	err = -errno;
++#ifdef __APPLE__
++	/* Darwin: once a failed connect has torn the socket down, getpeername() gives
++	 * EINVAL; the real reason (refused, timed out...) is in SO_ERROR. Keep EINVAL
++	 * if that's empty, so a failure can't read as success. */
++	{
++		int orig = err, soerr = 0;
++		socklen_t soerrlen = sizeof(soerr);
++		struct timespec now;
++
++		if (err == -EINVAL &&
++		    !getsockopt(sockfd, SOL_SOCKET, SO_ERROR, (void *)&soerr, &soerrlen) && soerr)
++			err = -soerr;
++		clock_gettime(CLOCK_MONOTONIC, &now);
++		vpn_progress(vpninfo, PRG_INFO,
++			     _("Connect from %s failed after %ld ms (getpeername: %s; socket error: %s)\n"),
++			     local,
++			     (long)((now.tv_sec - started.tv_sec) * 1000 + (now.tv_nsec - started.tv_nsec) / 1000000),
++			     strerror(-orig), soerr ? strerror(soerr) : "none");
++	}
++#endif
+ 	if (err == -ENOTCONN) {
+ 		char ch;
+ 
