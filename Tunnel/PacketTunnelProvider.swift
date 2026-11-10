@@ -66,6 +66,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let giveUpAfter: TimeInterval = 30 * 60
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
+        log(AppConfig.buildDescription)
         // Refresh the Control Center toggle whichever way this ends; otherwise it can
         // keep showing "Connected" after a failed or dropped connection. Before the
         // completion too: iOS may tear this process down right after a failure.

@@ -2,6 +2,12 @@ import Foundation
 import Security
 
 enum AppConfig {
+    static var buildDescription: String {
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "unknown"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown"
+        return "ConnectAnytime \(version) (build \(build))"
+    }
+
     static let defaultServer = "vpn.shanghai.nyu.edu"
     static let tunnelBundleID = "com.muunkk.connectanytime.tunnel"
     /// Answer to Cisco's "Second Password" prompt; sends a Duo push.

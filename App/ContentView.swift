@@ -110,6 +110,12 @@ struct ContentView: View {
                 } footer: {
                     Text("What the VPN did recently, such as reconnecting after a network change, and why it stopped.")
                 }
+
+                Section("About") {
+                    Text(AppConfig.buildDescription)
+                        .font(.footnote)
+                        .textSelection(.enabled)
+                }
             }
             .navigationTitle("ConnectAnytime")
         }
@@ -153,7 +159,7 @@ struct ActivityView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                ShareLink(item: lines.joined(separator: "\n")) { Image(systemName: "square.and.arrow.up") }
+                ShareLink(item: ([AppConfig.buildDescription] + lines).joined(separator: "\n")) { Image(systemName: "square.and.arrow.up") }
                     .disabled(lines.isEmpty)
                 Button("Clear") {
                     ActivityLog.clear()
