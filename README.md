@@ -74,6 +74,15 @@ Use an immutable matching Git tag, such as `v0.1.1`, and name the insider releas
 different code under an already used version/build pair. All three targets inherit
 the same version settings.
 
+Insiders receive builds through the **internal** TestFlight group in App Store
+Connect (app ID `6825901619`). Archive the Release configuration and export with
+`Config/ExportOptions-TestFlight.plist`, which preserves the version/build pair
+instead of letting Xcode change it. When exporting on this Mac, put `/usr/bin`
+before Homebrew in `PATH` so Xcode's rsync subprocess uses Apple's rsync.
+Upload the IPA, add What to Test notes identifying the fixes and requested checks,
+and verify that Apple has processed the build and made it available to the internal
+group. A Git tag alone does not distribute an iOS build.
+
 ## Build
 
 Requires a Mac with Xcode, [XcodeGen](https://github.com/yonaskolb/XcodeGen) and a paid
