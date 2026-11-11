@@ -62,6 +62,21 @@ static void progress_cb(void *priv, int level, const char *fmt, ...) {
     else if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
                           !strncmp(fmt, "sleep %ds", 9)))
         s->event(s->ctx, OCB_RECONNECTING, NULL);
+    // The server's limits on the session (how long it may last, sit idle, or wait for
+    // the phone to come back), from the CONNECT reply's headers. Only these: other
+    // DEBUG lines can hold the password or cookie.
+    if (level == PRG_DEBUG && !strcmp(fmt, "%s: %s\n")) {
+        static const char *limits[] = { "X-CSTP-Lease-Duration", "X-CSTP-Session-Timeout",
+            "X-CSTP-Session-Timeout-Remaining", "X-CSTP-Idle-Timeout",
+            "X-CSTP-Disconnected-Timeout", "X-CSTP-Session-Timeout-Alert-Interval", NULL };
+        va_list ap;
+        va_start(ap, fmt);
+        const char *name = va_arg(ap, const char *), *value = va_arg(ap, const char *);
+        va_end(ap);
+        for (int i = 0; name && value && limits[i]; i++)
+            if (!strcasecmp(name, limits[i])) logf_(s, PRG_INFO, "Server limit %s: %s", name + 7, value);
+        return;
+    }
     if (level > PRG_INFO) return;
     char buf[1024];
     va_list ap;

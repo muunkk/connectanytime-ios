@@ -66,7 +66,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     private static let giveUpAfter: TimeInterval = 30 * 60
 
     override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
-        log(AppConfig.buildDescription)
         // Refresh the Control Center toggle whichever way this ends; otherwise it can
         // keep showing "Connected" after a failed or dropped connection. Before the
         // completion too: iOS may tear this process down right after a failure.
@@ -78,6 +77,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let manual = options?[AppConfig.manualStartKey] != nil
         guard let proto = protocolConfiguration as? NETunnelProviderProtocol,
               let user = proto.username, !user.isEmpty else {
+            log(AppConfig.buildDescription)
             return done(failure("Open ConnectAnytime and enter your NetID."))
         }
         let server = proto.serverAddress ?? AppConfig.defaultServer
@@ -86,6 +86,17 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let saved = savedSession()
         // One saved for another NetID or server, before you changed it: no use now.
         if saved == nil, SessionStore.load() != nil { SessionStore.clear() }
+        // An automatic start with no session to rejoin can only fail, and Stay Connected
+        // asks again at once, several times a second, until the app is opened (only the
+        // app can turn it off). Note the run of them instead of each one, so the log
+        // keeps what led up to it.
+        if saved == nil, !KeychainItem.isLocked(SavedSessionItem.account),
+           let refusal = Self.loginRefusal(manual: manual) {
+            RefusedStarts.note(refusal, log: log)
+            return done(NSError(domain: "ConnectAnytime", code: 1, userInfo: [NSLocalizedDescriptionKey: refusal]))
+        }
+        RefusedStarts.end(log: log)
+        log(AppConfig.buildDescription)
         if RunMarker.isSet {
             // Set while the tunnel is up, cleared whenever it stops: so the last run ended
             // without stopping, e.g. iOS ended the extension or it crashed.
@@ -192,6 +203,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                     return done(self.failure("Couldn't find the tunnel interface."))
                 }
                 self.log("Connected")
+                RefusedStarts.clearNotification()
                 self.sessionLock.withLock { if !self._stopping { RunMarker.set() } } // see stopTunnel
                 done(nil)
                 self.queue.async {
@@ -219,6 +231,28 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         ActivityLog.flush()
         completionHandler()
         VPNQuickControl.reloadControl()
+    }
+
+    /// When the phone went to sleep (under sessionLock), for the Activity log: whether a
+    /// session ends while it's asleep, and for how long it slept.
+    private var _asleepSince: Date?
+
+    override func sleep(completionHandler: @escaping () -> Void) {
+        sessionLock.withLock { _asleepSince = Date() }
+        ActivityLog.flush() // iOS may suspend this process
+        completionHandler()
+    }
+
+    override func wake() {
+        guard let since = sessionLock.withLock({ () -> Date? in
+            defer { _asleepSince = nil }
+            return _asleepSince
+        }) else { return }
+        let minutes = Int(Date().timeIntervalSince(since) / 60)
+        // Brief naps are frequent and say little; a long one is what an overnight drop follows.
+        if minutes >= 1 {
+            log("Woke after \(minutes) min asleep (since \(since.formatted(date: .omitted, time: .shortened)))")
+        }
     }
 
     // MARK: Helpers

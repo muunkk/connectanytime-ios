@@ -61,14 +61,17 @@ traffic through the tunnel.
 
 ## Versioning insider builds
 
-The current build is **0.1.1 (build 2)**, containing the hotspot and reconnect fixes
-merged in PR #13, with Activity logging retained to verify them on real networks.
+The current insider build is **0.1.2 (build 3)**, from the `overnight-diagnostics`
+branch: 0.1.1 (2) plus logging to find why the VPN can be off in the morning (the
+server's session limits, long sleeps, and a run of refused automatic starts counted
+instead of filling the log), and a notification when the session has ended. 0.1.1
+(build 2) contains the hotspot and reconnect fixes merged in PR #13.
 The app shows its version under About and includes it in shared Activity logs.
 Each tunnel start also records the extension's version, so older log entries remain
 distinguishable after an update.
 
 For every distributed fix, increment the patch version and build number in
-`project.yml` (next: `0.1.2`, build `3`), then run `xcodegen generate` before building.
+`project.yml` (next: `0.1.3`, build `4`), then run `xcodegen generate` before building.
 Use an immutable matching Git tag, such as `v0.1.1`, and name the insider release
 `0.1.1 (2) — Hotspot and reconnect fixes`. Never replace an existing tag or distribute
 different code under an already used version/build pair. All three targets inherit

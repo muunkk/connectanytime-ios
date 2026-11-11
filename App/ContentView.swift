@@ -1,5 +1,6 @@
 import NetworkExtension
 import SwiftUI
+import UserNotifications
 
 struct ContentView: View {
     @EnvironmentObject private var vpn: VPNController
@@ -119,7 +120,11 @@ struct ContentView: View {
             }
             .navigationTitle("ConnectAnytime")
         }
-        .task { await vpn.load() }
+        .task {
+            await vpn.load()
+            // So the VPN can say when the session has ended and it needs you to tap Connect.
+            _ = try? await UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound])
+        }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { vpn.refresh() } // e.g. back from approving in Duo
         }

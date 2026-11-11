@@ -111,7 +111,7 @@ enum KeychainItem {
 /// and our own, never the password or the session cookie.
 enum ActivityLog {
     private static let account = "activity"
-    private static let maxLines = 300
+    private static let maxLines = 1500 // room for a night of reconnects
     private static let writes = DispatchQueue(label: "connectanytime.activity", qos: .utility)
     /// Lines not yet saved. Only touched on `writes`.
     nonisolated(unsafe) private static var pending: [String] = []
