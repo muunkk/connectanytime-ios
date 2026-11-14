@@ -74,9 +74,10 @@ final class VPNController: ObservableObject {
 
     // MARK: Actions
 
-    /// Returns why it didn't go ahead, if it refused or couldn't start: Siri and Shortcuts
+    /// Returns why it didn't go ahead when it refused or couldn't start: Siri and Shortcuts
     /// report that, since nobody sees `lastError` there. Only this Connect's own reason,
-    /// not an error left by an attempt it didn't start.
+    /// not an error left by an attempt it didn't start. Nil, too, when it leaves an attempt
+    /// already under way (see `mayStartLogin`): one waiting for Duo, or iOS's rejoin.
     @discardableResult
     func connect() async -> String? {
         lastError = nil

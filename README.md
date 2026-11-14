@@ -104,7 +104,8 @@ The bundle IDs use `com.muunkk.*`. To build under your own team, change them in
 match.
 
 Run `Vendor/build-deps.sh` again whenever `Vendor/patches` changes. It rebuilds
-OpenConnect only if they did, and the app keeps linking the old library until you do.
+OpenConnect only if they did. Until you do, the tunnel's build stops with an error
+rather than link the old library.
 
 ### Tests and the Simulator
 

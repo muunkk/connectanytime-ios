@@ -32,6 +32,7 @@ struct ocb_session {
     char first_error[256]; // OpenConnect's first error in ocb_connect, to say why it failed
     char *connect_url;
     char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
+    char limits_logged[6][64]; // the session limits last logged, in log_server_limits' order
 };
 
 enum { LOGIN_IDLE, LOGIN_SENDING_SECRETS, LOGIN_ABORTED };
@@ -60,10 +61,14 @@ static void log_server_limits(struct ocb_session *s) {
         "X-CSTP-Disconnected-Timeout", "X-CSTP-Session-Timeout-Alert-Interval", NULL };
     const struct oc_vpn_option *opt = NULL;
     if (openconnect_get_ip_info(s->vpn, NULL, &opt, NULL)) return;
+    // Only the ones that changed since they were last logged, so reconnects through
+    // the night don't push older lines out of the Activity log.
     for (; opt; opt = opt->next)
         for (int i = 0; opt->option && opt->value && limits[i]; i++)
-            if (!strcasecmp(opt->option, limits[i]))
+            if (!strcasecmp(opt->option, limits[i]) && strcmp(s->limits_logged[i], opt->value)) {
+                snprintf(s->limits_logged[i], sizeof s->limits_logged[i], "%s", opt->value);
                 logf_(s, PRG_INFO, "Server limit %s: %s", opt->option + 7, opt->value);
+            }
 }
 
 // OpenConnect progress. Capped at PRG_INFO: DEBUG/TRACE dump HTTP bodies,

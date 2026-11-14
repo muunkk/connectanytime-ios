@@ -57,6 +57,21 @@ targets:
         "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": "$(SRCROOT)/Vendor/out-sim/lib"
         OTHER_LDFLAGS: "-lopenconnect -lssl -lcrypto -lxml2 -lz -liconv"
         ENABLE_BITCODE: NO
+    preBuildScripts:
+      # Xcode never runs build-deps.sh, so stop a build that would link libraries made
+      # without the current OpenConnect patches.
+      - name: Check OpenConnect patches
+        shell: /bin/zsh
+        basedOnDependencyAnalysis: false
+        script: |
+          cd "$SRCROOT/Vendor"
+          if [[ "$PLATFORM_NAME" == iphonesimulator ]]; then out=out-sim arg=" simulator"; else out=out arg=""; fi
+          patches=(patches/openconnect-*.patch(N))
+          want=$(cat "${patches[@]}" </dev/null | shasum -a 256 | awk '{print $1}')
+          if [[ "$(cat "$out/lib/openconnect-patches.sha256" 2>/dev/null)" != "$want" ]]; then
+            echo "error: Vendor/$out was built without the current OpenConnect patches. Run Vendor/build-deps.sh$arg."
+            exit 1
+          fi
     info:
       path: Tunnel/Info.plist
       properties:
