@@ -52,6 +52,9 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Tunnel/Tunnel-Bridging-Header.h
         HEADER_SEARCH_PATHS: "$(SRCROOT)/Vendor/out/include"
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/Vendor/out/lib"
+        # The libraries built by `Vendor/build-deps.sh simulator`.
+        "HEADER_SEARCH_PATHS[sdk=iphonesimulator*]": "$(SRCROOT)/Vendor/out-sim/include"
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": "$(SRCROOT)/Vendor/out-sim/lib"
         OTHER_LDFLAGS: "-lopenconnect -lssl -lcrypto -lxml2 -lz -liconv"
         ENABLE_BITCODE: NO
     info:

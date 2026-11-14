@@ -105,7 +105,7 @@ match.
 Run `Vendor/build-deps.sh` again whenever `Vendor/patches` changes. It rebuilds
 OpenConnect only if they did, and the app keeps linking the old library until you do.
 
-### Tests
+### Tests and the Simulator
 
 ```sh
 xcodebuild test -project ConnectAnytime.xcodeproj -scheme ConnectAnytimeTests \
@@ -114,6 +114,15 @@ xcodebuild test -project ConnectAnytime.xcodeproj -scheme ConnectAnytimeTests \
 
 The unit tests cover logic that needs no VPN or Keychain, and run on the Simulator
 without the app or the libraries above.
+
+A VPN can't run in the Simulator, but the whole app builds for it once the libraries
+exist for it too (Apple silicon Macs only):
+
+```sh
+Vendor/build-deps.sh simulator   # into Vendor/out-sim
+xcodebuild build -project ConnectAnytime.xcodeproj -scheme ConnectAnytime \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO
+```
 
 ## Licenses
 
