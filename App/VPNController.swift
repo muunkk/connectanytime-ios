@@ -54,6 +54,9 @@ final class VPNController: ObservableObject {
     func load() async {
         guard manager == nil else { return }
         let existing = (try? await NETunnelProviderManager.loadAllFromPreferences())?.first
+        // Another caller (the view, or an intent at launch) may have loaded it meanwhile;
+        // a second manager would add a second status observer.
+        guard manager == nil else { return }
         manager = existing ?? NETunnelProviderManager()
         observeStatus()
         if existing != nil, UserDefaults.standard.integer(forKey: "onDemandRulesVersion") < Self.onDemandRulesVersion {
@@ -74,6 +77,8 @@ final class VPNController: ObservableObject {
     func connect() async {
         lastError = nil
         await load()
+        // An emptied Server field would be saved as the address, and kept.
+        if server.trimmingCharacters(in: .whitespaces).isEmpty { server = AppConfig.defaultServer }
         guard !netID.trimmingCharacters(in: .whitespaces).isEmpty else { return lastError = "Enter your NetID first." }
         guard hasPassword else { return lastError = "Save your password first." }
         guard ![.connected, .reasserting].contains(status) else { return }
@@ -182,6 +187,7 @@ final class VPNController: ObservableObject {
     /// right away. The next Connect turns them back on.
     func disconnect() async {
         lastError = nil
+        await load()
         guard let m = manager else { return }
         ConnectIntent.set(disconnected: true)
         await inOrder {
@@ -202,8 +208,9 @@ final class VPNController: ObservableObject {
 
     func savePassword(_ password: String) {
         guard !password.isEmpty else { return }
-        hasPassword = SharedKeychain.save(password)
-        if !hasPassword { lastError = "Couldn't save the password to the Keychain." }
+        let saved = SharedKeychain.save(password)
+        hasPassword = saved || SharedKeychain.hasPassword // a failed write keeps the old one
+        lastError = saved ? nil : "Couldn't save the password to the Keychain."
     }
 
     func addAutoNetwork(_ ssid: String) {
@@ -220,9 +227,7 @@ final class VPNController: ObservableObject {
 
     /// The Wi-Fi network the phone is on now (needs the VPN configuration to exist).
     func currentWiFi() async -> String? {
-        await withCheckedContinuation { cont in
-            NEHotspotNetwork.fetchCurrent { cont.resume(returning: $0?.ssid) }
-        }
+        await NEHotspotNetwork.fetchCurrent()?.ssid
     }
 
     // MARK: Configuration
@@ -333,7 +338,7 @@ final class VPNController: ObservableObject {
             rulesSavePending = false
             inOrder { await self.applyOnDemand() }
         }
-        if VPNQuickControl.mayArm(status) { armOnDemandIfConnected() }
+        armOnDemandIfConnected()
         if [.disconnected, .connecting].contains(status) { disarmIfNothingToRejoin() }
         VPNQuickControl.reloadControl()
         if status == .disconnected, old != .disconnected {

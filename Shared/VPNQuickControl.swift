@@ -4,7 +4,8 @@ import os
 import WidgetKit
 
 /// Connect/disconnect using the VPN configuration the app already saved.
-/// Used by the Control Center toggle, which runs outside the app.
+/// Used by the Control Center toggle, which runs outside the app, and by the app's own
+/// Connect (waiting, settling, arming); the tunnel uses it to refresh the toggle.
 enum VPNQuickControl {
     private static let logger = Logger(subsystem: "com.muunkk.connectanytime", category: "control")
 
