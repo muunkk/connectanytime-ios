@@ -150,7 +150,7 @@ static int validate_cert_cb(void *priv, const char *reason) {
     if (n <= 0) return 1;
 
     CFMutableArrayRef certs = CFArrayCreateMutable(NULL, n, &kCFTypeArrayCallBacks);
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; certs && i < n; i++) {
         CFDataRef der = CFDataCreate(NULL, chain[i].der_data, chain[i].der_len);
         SecCertificateRef c = der ? SecCertificateCreateWithData(NULL, der) : NULL;
         if (c) { CFArrayAppendValue(certs, c); CFRelease(c); }
@@ -160,11 +160,12 @@ static int validate_cert_cb(void *priv, const char *reason) {
 
     // get_hostname() can return the resolved IP; the certificate is issued to the DNS name.
     const char *hostname = openconnect_get_dnsname(s->vpn);
-    CFStringRef host = CFStringCreateWithCString(NULL, hostname ? hostname : "", kCFStringEncodingUTF8);
-    SecPolicyRef policy = SecPolicyCreateSSL(true, host);
+    CFStringRef host = hostname && *hostname
+        ? CFStringCreateWithCString(NULL, hostname, kCFStringEncodingUTF8) : NULL;
+    SecPolicyRef policy = host ? SecPolicyCreateSSL(true, host) : NULL;
     SecTrustRef trust = NULL;
     CFErrorRef trustError = NULL;
-    OSStatus created = CFArrayGetCount(certs) > 0
+    OSStatus created = certs && host && policy && CFArrayGetCount(certs) > 0
         ? SecTrustCreateWithCertificates(certs, policy, &trust) : errSecParam;
     bool ok = created == errSecSuccess && SecTrustEvaluateWithError(trust, &trustError);
     char why[160] = "";
@@ -174,7 +175,7 @@ static int validate_cert_cb(void *priv, const char *reason) {
         CFRelease(trustError);
     }
     if (trust) CFRelease(trust);
-    CFRelease(policy);
+    if (policy) CFRelease(policy);
     if (host) CFRelease(host);
 
     if (ok) logf_(s, PRG_INFO, "Server certificate verified by iOS");
@@ -182,9 +183,9 @@ static int validate_cert_cb(void *priv, const char *reason) {
         logf_(s, PRG_ERR, "Server certificate rejected (%s)", reason ? reason : "untrusted");
         snprintf(s->auth_error, sizeof s->auth_error,
                  "The server's certificate isn't trusted (%d certs from %d, host %s, status %d). %s",
-                 (int)CFArrayGetCount(certs), n, hostname ? hostname : "?", (int)created, why);
+                 (int)(certs ? CFArrayGetCount(certs) : 0), n, hostname ? hostname : "?", (int)created, why);
     }
-    CFRelease(certs);
+    if (certs) CFRelease(certs);
     return ok ? 0 : 1;
 }
 
@@ -209,6 +210,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     s->user = strdup(user);
     s->password = strdup(password);
     s->second = strdup(second_password);
+    if (!s->server || !s->user || !s->password || !s->second) { ocb_free(s); return NULL; }
     s->log = log;
     s->event = event;
     s->ctx = ctx;
@@ -218,6 +220,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     openconnect_set_reported_os(s->vpn, "apple-ios");
     openconnect_set_reconnected_handler(s->vpn, reconnected_cb);
     s->cmd_fd = openconnect_setup_cmd_pipe(s->vpn);
+    if (s->cmd_fd < 0) { ocb_free(s); return NULL; }
     return s;
 }
 
@@ -345,6 +348,7 @@ static char *join_routes(struct oc_split_include *list) {
     for (struct oc_split_include *r = list; r; r = r->next) len += strlen(r->route) + 1;
     if (!len) return NULL;
     char *out = calloc(1, len + 1), *p = out;
+    if (!out) return NULL;
     for (struct oc_split_include *r = list; r; r = r->next) p += sprintf(p, "%s\n", r->route);
     return out;
 }
@@ -366,6 +370,7 @@ int ocb_get_config(ocb_session *s, ocb_config *out) {
     out->split_dns = join_routes(ip->split_dns);
     out->mtu = ip->mtu;
     out->key = config_key(out);
+    if (!out->key) { ocb_config_free(out); return -1; }
     return 0;
 }
 
