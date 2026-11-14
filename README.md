@@ -102,6 +102,9 @@ The bundle IDs use `com.muunkk.*`. To build under your own team, change them in
 `project.yml`, and change `tunnelBundleID` and `controlKind` in `Shared/Shared.swift` to
 match.
 
+Run `Vendor/build-deps.sh` again whenever `Vendor/patches` changes. It rebuilds
+OpenConnect only if they did, and the app keeps linking the old library until you do.
+
 ## Licenses
 
 ConnectAnytime's own code is MIT (see `LICENSE`). The build downloads and statically links
