@@ -348,7 +348,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let token = UUID()
         sessionLock.withLock { _loginToken = token; _loginTimedOut = false }
         let start = DispatchTime.now()
-        // After 20 s, and every second after that until ocb_connect returns.
+        // After 20 s, and every second after that until ocb_connect returns. Repeat
+        // either abort: one may only end the attempt on one of the server's addresses.
         let timer = DispatchSource.makeTimerSource(queue: .global())
         timer.schedule(deadline: start + 20, repeating: 1)
         var logged = false
@@ -358,7 +359,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let (current, aborted) = self.sessionLock.withLock {
                 guard self._loginToken == token, let s = self.session else { return (false, false) }
                 if ocb_cancel_unless_answered(s) { return (true, true) } // password not sent
-                if late, !self._loginTimedOut {
+                if late {
                     self._loginTimedOut = true
                     ocb_cancel(s) // no cookie yet, so nothing to log out of
                 }
@@ -369,7 +370,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.log("The VPN server didn't answer within 20 s")
                 logged = true
             }
-            if late { timer.cancel() }
         }
         timer.resume()
         defer { timer.cancel() }
