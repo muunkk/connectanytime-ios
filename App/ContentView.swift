@@ -26,7 +26,7 @@ struct ContentView: View {
                             .font(.headline)
                         Button {
                             focused = nil
-                            Task { vpn.isConnected || vpn.isBusy ? await vpn.disconnect() : await vpn.connect() }
+                            Task { if vpn.isConnected || vpn.isBusy { await vpn.disconnect() } else { await vpn.connect() } }
                         } label: {
                             Text(vpn.isConnected || vpn.isBusy ? "Disconnect" : "Connect")
                                 .frame(maxWidth: .infinity)

@@ -25,8 +25,7 @@ struct ConnectVPNIntent: AppIntent {
     // Require Face ID / passcode when run from the lock screen or Siri on a locked phone.
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     func perform() async throws -> some IntentResult {
-        await VPNController.shared.connect()
-        if let error = await VPNController.shared.lastError { throw ConnectFailed(message: error) }
+        if let refusal = await VPNController.shared.connect() { throw ConnectFailed(message: refusal) }
         return .result()
     }
 }
@@ -46,9 +45,7 @@ struct ToggleVPNIntent: AppIntent {
     // Require Face ID / passcode when run from the lock screen or Siri on a locked phone.
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     func perform() async throws -> some IntentResult {
-        if await VPNController.shared.toggle(), let error = await VPNController.shared.lastError {
-            throw ConnectFailed(message: error)
-        }
+        if let refusal = await VPNController.shared.toggle() { throw ConnectFailed(message: refusal) }
         return .result()
     }
 }

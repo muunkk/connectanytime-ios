@@ -74,16 +74,21 @@ final class VPNController: ObservableObject {
 
     // MARK: Actions
 
-    func connect() async {
+    /// Returns why it didn't go ahead, if it refused or couldn't start: Siri and Shortcuts
+    /// report that, since nobody sees `lastError` there. Only this Connect's own reason,
+    /// not an error left by an attempt it didn't start.
+    @discardableResult
+    func connect() async -> String? {
         lastError = nil
         await load()
+        guard ![.connected, .reasserting].contains(status) else { return nil } // nothing to ask for
         // An emptied Server field would be saved as the address, and kept.
         if server.trimmingCharacters(in: .whitespaces).isEmpty { server = AppConfig.defaultServer }
-        guard !netID.trimmingCharacters(in: .whitespaces).isEmpty else { return lastError = "Enter your NetID first." }
-        guard hasPassword else { return lastError = "Save your password first." }
-        guard ![.connected, .reasserting].contains(status) else { return }
+        guard !netID.trimmingCharacters(in: .whitespaces).isEmpty else { return refuse("Enter your NetID first.") }
+        guard hasPassword else { return refuse("Save your password first.") }
         ConnectIntent.set(disconnected: false)
         var started: NEVPNConnection?
+        var refusal: String?
         await inOrder {
             guard let m = self.manager else { return }
             guard await self.mayStartLogin(m) else { return }
@@ -96,7 +101,9 @@ final class VPNController: ObservableObject {
                 switch settled {
                 case .connected, .reasserting: return
                 case .disconnected, .invalid: break
-                default: return self.lastError = "The last attempt is still stopping. Tap Connect again in a moment."
+                default:
+                    refusal = self.refuse("The last attempt is still stopping. Tap Connect again in a moment.")
+                    return
                 }
                 // From here an error is this login's; one from the attempt it replaced may
                 // have landed meanwhile (see starts).
@@ -109,10 +116,16 @@ final class VPNController: ObservableObject {
                 await VPNQuickControl.wait(m.connection, whileIn: [.disconnected, .invalid])
                 started = m.connection
             } catch {
-                self.lastError = error.localizedDescription
+                refusal = self.refuse(error.localizedDescription)
             }
         }.value
         if let started { armWhenConnected(started) }
+        return refusal
+    }
+
+    private func refuse(_ message: String) -> String {
+        lastError = message
+        return message
     }
 
     /// Turns Stay Connected on once this login is through. Approving Duo usually means
@@ -198,12 +211,11 @@ final class VPNController: ObservableObject {
         }.value
     }
 
-    /// Returns whether it chose Connect (whatever came of it) rather than Disconnect.
-    func toggle() async -> Bool {
+    /// As `connect`: why it didn't go ahead, if it chose Connect and that refused.
+    func toggle() async -> String? {
         await load()
-        if isConnected || isBusy { await disconnect(); return false }
-        await connect()
-        return true
+        if isConnected || isBusy { await disconnect(); return nil }
+        return await connect()
     }
 
     func savePassword(_ password: String) {
