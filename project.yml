@@ -57,6 +57,9 @@ targets:
         "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": "$(SRCROOT)/Vendor/out-sim/lib"
         OTHER_LDFLAGS: "-lopenconnect -lssl -lcrypto -lxml2 -lz -liconv"
         ENABLE_BITCODE: NO
+        # The patch check below reads Vendor/patches and Vendor/out*, which a sandboxed
+        # script can't.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
     preBuildScripts:
       # Xcode never runs build-deps.sh, so stop a build that would link libraries made
       # without the current OpenConnect patches.
