@@ -345,7 +345,9 @@ final class VPNController: ObservableObject {
         guard let m = manager else { return }
         let old = status
         status = m.connection.status
-        if status == .connected { lastError = nil } // up again, e.g. by Stay Connected: an earlier drop's error is over
+        // Up again, e.g. by Stay Connected: an earlier drop's error is over. Only as it
+        // comes up, so an error about something else (a failed password save) stays.
+        if status == .connected, old != .connected { lastError = nil }
         if status != .connecting, rulesSavePending {
             rulesSavePending = false
             inOrder { await self.applyOnDemand() }
@@ -357,9 +359,9 @@ final class VPNController: ObservableObject {
             let start = starts
             m.connection.fetchLastDisconnectError { error in
                 Task { @MainActor in
-                    // Not this attempt's if a Connect has since replaced it, nor the stop after
-                    // your Disconnect ("Cancelled."); and it's over if the VPN is already back.
-                    guard self.starts == start, !ConnectIntent.disconnected, self.status != .connected else { return }
+                    // Not this attempt's if a Connect has since replaced it, and it's over if
+                    // the VPN is already back.
+                    guard self.starts == start, self.status != .connected else { return }
                     if let error, (error as NSError).domain != NEVPNConnectionErrorDomain || (error as NSError).code != 0 {
                         self.lastError = error.localizedDescription
                     }
