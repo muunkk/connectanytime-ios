@@ -98,6 +98,8 @@ targets:
     sources:
       - Tests
       - Tunnel/SplitRoute.swift
+      - Tunnel/RefusedStarts.swift
+      - Shared/Shared.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.muunkk.connectanytime.tests
