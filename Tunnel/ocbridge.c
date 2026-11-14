@@ -50,6 +50,22 @@ static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
     if (n) s->log(s->ctx, level, buf);
 }
 
+// The server's limits on the session (how long it may last, sit idle, or wait for
+// the phone to come back), from the CONNECT reply's headers, which OpenConnect keeps
+// as the session's options. Only these: other options can hold the session cookie.
+// (It also reports the headers as progress, but at DEBUG, which stays off.)
+static void log_server_limits(struct ocb_session *s) {
+    static const char *limits[] = { "X-CSTP-Lease-Duration", "X-CSTP-Session-Timeout",
+        "X-CSTP-Session-Timeout-Remaining", "X-CSTP-Idle-Timeout",
+        "X-CSTP-Disconnected-Timeout", "X-CSTP-Session-Timeout-Alert-Interval", NULL };
+    const struct oc_vpn_option *opt = NULL;
+    if (openconnect_get_ip_info(s->vpn, NULL, &opt, NULL)) return;
+    for (; opt; opt = opt->next)
+        for (int i = 0; opt->option && opt->value && limits[i]; i++)
+            if (!strcasecmp(opt->option, limits[i]))
+                logf_(s, PRG_INFO, "Server limit %s: %s", opt->option + 7, opt->value);
+}
+
 // OpenConnect progress. Capped at PRG_INFO: DEBUG/TRACE dump HTTP bodies,
 // which include the submitted password.
 static void progress_cb(void *priv, int level, const char *fmt, ...) {
@@ -62,21 +78,6 @@ static void progress_cb(void *priv, int level, const char *fmt, ...) {
     else if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
                           !strncmp(fmt, "sleep %ds", 9)))
         s->event(s->ctx, OCB_RECONNECTING, NULL);
-    // The server's limits on the session (how long it may last, sit idle, or wait for
-    // the phone to come back), from the CONNECT reply's headers. Only these: other
-    // DEBUG lines can hold the password or cookie.
-    if (level == PRG_DEBUG && !strcmp(fmt, "%s: %s\n")) {
-        static const char *limits[] = { "X-CSTP-Lease-Duration", "X-CSTP-Session-Timeout",
-            "X-CSTP-Session-Timeout-Remaining", "X-CSTP-Idle-Timeout",
-            "X-CSTP-Disconnected-Timeout", "X-CSTP-Session-Timeout-Alert-Interval", NULL };
-        va_list ap;
-        va_start(ap, fmt);
-        const char *name = va_arg(ap, const char *), *value = va_arg(ap, const char *);
-        va_end(ap);
-        for (int i = 0; name && value && limits[i]; i++)
-            if (!strcasecmp(name, limits[i])) logf_(s, PRG_INFO, "Server limit %s: %s", name + 7, value);
-        return;
-    }
     if (level > PRG_INFO) return;
     char buf[1024];
     va_list ap;
@@ -251,6 +252,7 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Logged in, but couldn't open the VPN session.");
         return -1;
     }
+    log_server_limits(s);
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
         logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
@@ -306,6 +308,7 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
                                              : "Couldn't reach the VPN server.");
         return ret == -EPERM ? OCB_SESSION_ENDED : -1;
     }
+    log_server_limits(s);
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
         logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
@@ -384,6 +387,7 @@ static char *config_key(const ocb_config *c) {
 static void reconnected_cb(void *priv) {
     struct ocb_session *s = priv;
     logf_(s, PRG_INFO, "Reconnected with the existing session");
+    log_server_limits(s); // they change: e.g. how much of the session's time is left
     ocb_config cfg;
     bool ok = ocb_get_config(s, &cfg) == 0 && cfg.key;
     if (s->event) s->event(s->ctx, OCB_RECONNECTED, ok ? &cfg : NULL);
