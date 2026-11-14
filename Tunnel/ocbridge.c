@@ -370,7 +370,13 @@ int ocb_get_config(ocb_session *s, ocb_config *out) {
     out->split_dns = join_routes(ip->split_dns);
     out->mtu = ip->mtu;
     out->key = config_key(out);
-    if (!out->key) { ocb_config_free(out); return -1; }
+    // A list that couldn't be copied mustn't read as an empty one: with no split
+    // includes the tunnel takes everything.
+    if (!out->key || (ip->split_includes && !out->split_includes) ||
+        (ip->split_excludes && !out->split_excludes) || (ip->split_dns && !out->split_dns)) {
+        ocb_config_free(out);
+        return -1;
+    }
     return 0;
 }
 
