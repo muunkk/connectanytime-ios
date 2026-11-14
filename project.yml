@@ -90,3 +90,22 @@ targets:
       properties:
         com.apple.developer.networking.networkextension: [packet-tunnel-provider]
         keychain-access-groups: ["$(KEYCHAIN_GROUP)"]
+  # Unit tests for logic that needs no VPN, Keychain or host app. The sources under
+  # test are compiled into the bundle, so it runs on the Simulator without the app.
+  ConnectAnytimeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+      - Tunnel/SplitRoute.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.muunkk.connectanytime.tests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  ConnectAnytimeTests:
+    build:
+      targets:
+        ConnectAnytimeTests: [test]
+    test:
+      targets: [ConnectAnytimeTests]

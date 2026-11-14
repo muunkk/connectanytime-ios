@@ -804,12 +804,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// "10.0.0.0/255.0.0.0" or "10.0.0.0/8" → route. IPv6 entries are skipped.
     private static func ipv4Route(_ route: String) -> NEIPv4Route? {
-        let parts = route.split(separator: "/").map(String.init)
-        guard parts.count == 2, !parts[0].contains(":") else { return nil }
-        if parts[1].contains(".") { return NEIPv4Route(destinationAddress: parts[0], subnetMask: parts[1]) }
-        guard let bits = Int(parts[1]), (0...32).contains(bits) else { return nil }
-        let mask = bits == 0 ? 0 : UInt32.max << (32 - UInt32(bits))
-        let dotted = [24, 16, 8, 0].map { String((mask >> UInt32($0)) & 0xff) }.joined(separator: ".")
-        return NEIPv4Route(destinationAddress: parts[0], subnetMask: dotted)
+        SplitRoute.ipv4(route).map { NEIPv4Route(destinationAddress: $0.address, subnetMask: $0.mask) }
     }
 }
