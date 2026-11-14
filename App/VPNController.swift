@@ -192,9 +192,12 @@ final class VPNController: ObservableObject {
         }.value
     }
 
-    func toggle() async {
+    /// Returns whether it chose Connect (whatever came of it) rather than Disconnect.
+    func toggle() async -> Bool {
         await load()
-        if isConnected || isBusy { await disconnect() } else { await connect() }
+        if isConnected || isBusy { await disconnect(); return false }
+        await connect()
+        return true
     }
 
     func savePassword(_ password: String) {
