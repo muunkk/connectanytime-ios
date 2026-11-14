@@ -206,6 +206,12 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 RefusedStarts.clearNotification()
                 self.sessionLock.withLock { if !self._stopping { RunMarker.set() } } // see stopTunnel
                 done(nil)
+                // The toggle says "Connecting…" until it reads the VPN as up, which iOS may
+                // only report a moment after done's refresh; once more later, in case iOS
+                // drops a refresh from the extension.
+                for delay in [1.0, 5.0] {
+                    DispatchQueue.global().asyncAfter(deadline: .now() + delay) { VPNQuickControl.reloadControl() }
+                }
                 self.queue.async {
                     self.tunFD = fd
                     self.watchNetwork()
@@ -348,7 +354,8 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let token = UUID()
         sessionLock.withLock { _loginToken = token; _loginTimedOut = false }
         let start = DispatchTime.now()
-        // After 20 s, and every second after that until ocb_connect returns.
+        // After 20 s, and every second after that until ocb_connect returns. Repeat
+        // either abort: one may only end the attempt on one of the server's addresses.
         let timer = DispatchSource.makeTimerSource(queue: .global())
         timer.schedule(deadline: start + 20, repeating: 1)
         var logged = false
@@ -358,7 +365,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             let (current, aborted) = self.sessionLock.withLock {
                 guard self._loginToken == token, let s = self.session else { return (false, false) }
                 if ocb_cancel_unless_answered(s) { return (true, true) } // password not sent
-                if late, !self._loginTimedOut {
+                if late {
                     self._loginTimedOut = true
                     ocb_cancel(s) // no cookie yet, so nothing to log out of
                 }
@@ -369,7 +376,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 self.log("The VPN server didn't answer within 20 s")
                 logged = true
             }
-            if late { timer.cancel() }
         }
         timer.resume()
         defer { timer.cancel() }
@@ -804,12 +810,6 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
 
     /// "10.0.0.0/255.0.0.0" or "10.0.0.0/8" → route. IPv6 entries are skipped.
     private static func ipv4Route(_ route: String) -> NEIPv4Route? {
-        let parts = route.split(separator: "/").map(String.init)
-        guard parts.count == 2, !parts[0].contains(":") else { return nil }
-        if parts[1].contains(".") { return NEIPv4Route(destinationAddress: parts[0], subnetMask: parts[1]) }
-        guard let bits = Int(parts[1]), (0...32).contains(bits) else { return nil }
-        let mask = bits == 0 ? 0 : UInt32.max << (32 - UInt32(bits))
-        let dotted = [24, 16, 8, 0].map { String((mask >> UInt32($0)) & 0xff) }.joined(separator: ".")
-        return NEIPv4Route(destinationAddress: parts[0], subnetMask: dotted)
+        SplitRoute.ipv4(route).map { NEIPv4Route(destinationAddress: $0.address, subnetMask: $0.mask) }
     }
 }

@@ -32,6 +32,7 @@ struct ocb_session {
     char first_error[256]; // OpenConnect's first error in ocb_connect, to say why it failed
     char *connect_url;
     char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
+    char limits_logged[6][64]; // the session limits last logged, in log_server_limits' order
 };
 
 enum { LOGIN_IDLE, LOGIN_SENDING_SECRETS, LOGIN_ABORTED };
@@ -50,6 +51,26 @@ static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
     if (n) s->log(s->ctx, level, buf);
 }
 
+// The server's limits on the session (how long it may last, sit idle, or wait for
+// the phone to come back), from the CONNECT reply's headers, which OpenConnect keeps
+// as the session's options. Only these: other options can hold the session cookie.
+// (It also reports the headers as progress, but at DEBUG, which stays off.)
+static void log_server_limits(struct ocb_session *s) {
+    static const char *limits[] = { "X-CSTP-Lease-Duration", "X-CSTP-Session-Timeout",
+        "X-CSTP-Session-Timeout-Remaining", "X-CSTP-Idle-Timeout",
+        "X-CSTP-Disconnected-Timeout", "X-CSTP-Session-Timeout-Alert-Interval", NULL };
+    const struct oc_vpn_option *opt = NULL;
+    if (openconnect_get_ip_info(s->vpn, NULL, &opt, NULL)) return;
+    // Only the ones that changed since they were last logged, so reconnects through
+    // the night don't push older lines out of the Activity log.
+    for (; opt; opt = opt->next)
+        for (int i = 0; opt->option && opt->value && limits[i]; i++)
+            if (!strcasecmp(opt->option, limits[i]) && strcmp(s->limits_logged[i], opt->value)) {
+                snprintf(s->limits_logged[i], sizeof s->limits_logged[i], "%s", opt->value);
+                logf_(s, PRG_INFO, "Server limit %s: %s", opt->option + 7, opt->value);
+            }
+}
+
 // OpenConnect progress. Capped at PRG_INFO: DEBUG/TRACE dump HTTP bodies,
 // which include the submitted password.
 static void progress_cb(void *priv, int level, const char *fmt, ...) {
@@ -62,21 +83,6 @@ static void progress_cb(void *priv, int level, const char *fmt, ...) {
     else if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
                           !strncmp(fmt, "sleep %ds", 9)))
         s->event(s->ctx, OCB_RECONNECTING, NULL);
-    // The server's limits on the session (how long it may last, sit idle, or wait for
-    // the phone to come back), from the CONNECT reply's headers. Only these: other
-    // DEBUG lines can hold the password or cookie.
-    if (level == PRG_DEBUG && !strcmp(fmt, "%s: %s\n")) {
-        static const char *limits[] = { "X-CSTP-Lease-Duration", "X-CSTP-Session-Timeout",
-            "X-CSTP-Session-Timeout-Remaining", "X-CSTP-Idle-Timeout",
-            "X-CSTP-Disconnected-Timeout", "X-CSTP-Session-Timeout-Alert-Interval", NULL };
-        va_list ap;
-        va_start(ap, fmt);
-        const char *name = va_arg(ap, const char *), *value = va_arg(ap, const char *);
-        va_end(ap);
-        for (int i = 0; name && value && limits[i]; i++)
-            if (!strcasecmp(name, limits[i])) logf_(s, PRG_INFO, "Server limit %s: %s", name + 7, value);
-        return;
-    }
     if (level > PRG_INFO) return;
     char buf[1024];
     va_list ap;
@@ -149,7 +155,7 @@ static int validate_cert_cb(void *priv, const char *reason) {
     if (n <= 0) return 1;
 
     CFMutableArrayRef certs = CFArrayCreateMutable(NULL, n, &kCFTypeArrayCallBacks);
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; certs && i < n; i++) {
         CFDataRef der = CFDataCreate(NULL, chain[i].der_data, chain[i].der_len);
         SecCertificateRef c = der ? SecCertificateCreateWithData(NULL, der) : NULL;
         if (c) { CFArrayAppendValue(certs, c); CFRelease(c); }
@@ -159,11 +165,12 @@ static int validate_cert_cb(void *priv, const char *reason) {
 
     // get_hostname() can return the resolved IP; the certificate is issued to the DNS name.
     const char *hostname = openconnect_get_dnsname(s->vpn);
-    CFStringRef host = CFStringCreateWithCString(NULL, hostname ? hostname : "", kCFStringEncodingUTF8);
-    SecPolicyRef policy = SecPolicyCreateSSL(true, host);
+    CFStringRef host = hostname && *hostname
+        ? CFStringCreateWithCString(NULL, hostname, kCFStringEncodingUTF8) : NULL;
+    SecPolicyRef policy = host ? SecPolicyCreateSSL(true, host) : NULL;
     SecTrustRef trust = NULL;
     CFErrorRef trustError = NULL;
-    OSStatus created = CFArrayGetCount(certs) > 0
+    OSStatus created = certs && host && policy && CFArrayGetCount(certs) > 0
         ? SecTrustCreateWithCertificates(certs, policy, &trust) : errSecParam;
     bool ok = created == errSecSuccess && SecTrustEvaluateWithError(trust, &trustError);
     char why[160] = "";
@@ -173,7 +180,7 @@ static int validate_cert_cb(void *priv, const char *reason) {
         CFRelease(trustError);
     }
     if (trust) CFRelease(trust);
-    CFRelease(policy);
+    if (policy) CFRelease(policy);
     if (host) CFRelease(host);
 
     if (ok) logf_(s, PRG_INFO, "Server certificate verified by iOS");
@@ -181,9 +188,9 @@ static int validate_cert_cb(void *priv, const char *reason) {
         logf_(s, PRG_ERR, "Server certificate rejected (%s)", reason ? reason : "untrusted");
         snprintf(s->auth_error, sizeof s->auth_error,
                  "The server's certificate isn't trusted (%d certs from %d, host %s, status %d). %s",
-                 (int)CFArrayGetCount(certs), n, hostname ? hostname : "?", (int)created, why);
+                 (int)(certs ? CFArrayGetCount(certs) : 0), n, hostname ? hostname : "?", (int)created, why);
     }
-    CFRelease(certs);
+    if (certs) CFRelease(certs);
     return ok ? 0 : 1;
 }
 
@@ -208,6 +215,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     s->user = strdup(user);
     s->password = strdup(password);
     s->second = strdup(second_password);
+    if (!s->server || !s->user || !s->password || !s->second) { ocb_free(s); return NULL; }
     s->log = log;
     s->event = event;
     s->ctx = ctx;
@@ -217,6 +225,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     openconnect_set_reported_os(s->vpn, "apple-ios");
     openconnect_set_reconnected_handler(s->vpn, reconnected_cb);
     s->cmd_fd = openconnect_setup_cmd_pipe(s->vpn);
+    if (s->cmd_fd < 0) { ocb_free(s); return NULL; }
     return s;
 }
 
@@ -251,6 +260,7 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Logged in, but couldn't open the VPN session.");
         return -1;
     }
+    log_server_limits(s);
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
         logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
@@ -306,6 +316,7 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
                                              : "Couldn't reach the VPN server.");
         return ret == -EPERM ? OCB_SESSION_ENDED : -1;
     }
+    log_server_limits(s);
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
         logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
@@ -342,6 +353,7 @@ static char *join_routes(struct oc_split_include *list) {
     for (struct oc_split_include *r = list; r; r = r->next) len += strlen(r->route) + 1;
     if (!len) return NULL;
     char *out = calloc(1, len + 1), *p = out;
+    if (!out) return NULL;
     for (struct oc_split_include *r = list; r; r = r->next) p += sprintf(p, "%s\n", r->route);
     return out;
 }
@@ -363,6 +375,13 @@ int ocb_get_config(ocb_session *s, ocb_config *out) {
     out->split_dns = join_routes(ip->split_dns);
     out->mtu = ip->mtu;
     out->key = config_key(out);
+    // A list that couldn't be copied mustn't read as an empty one: with no split
+    // includes the tunnel takes everything.
+    if (!out->key || (ip->split_includes && !out->split_includes) ||
+        (ip->split_excludes && !out->split_excludes) || (ip->split_dns && !out->split_dns)) {
+        ocb_config_free(out);
+        return -1;
+    }
     return 0;
 }
 
@@ -384,6 +403,7 @@ static char *config_key(const ocb_config *c) {
 static void reconnected_cb(void *priv) {
     struct ocb_session *s = priv;
     logf_(s, PRG_INFO, "Reconnected with the existing session");
+    log_server_limits(s); // they change: e.g. how much of the session's time is left
     ocb_config cfg;
     bool ok = ocb_get_config(s, &cfg) == 0 && cfg.key;
     if (s->event) s->event(s->ctx, OCB_RECONNECTED, ok ? &cfg : NULL);

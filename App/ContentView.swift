@@ -1,3 +1,4 @@
+import Accessibility
 import NetworkExtension
 import SwiftUI
 import UserNotifications
@@ -7,7 +8,9 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var password = ""
     @State private var newNetwork = ""
-    @FocusState private var focused: Bool
+    @FocusState private var focused: Field?
+
+    private enum Field { case netID, password, network, server }
 
     var body: some View {
         NavigationStack {
@@ -18,11 +21,12 @@ struct ContentView: View {
                             .font(.system(size: 56, weight: .regular))
                             .foregroundStyle(vpn.isConnected ? Color.accentColor : .secondary)
                             .contentTransition(.symbolEffect(.replace))
+                            .accessibilityHidden(true) // the status text says it
                         Text(statusText)
                             .font(.headline)
                         Button {
-                            focused = false
-                            Task { vpn.isConnected || vpn.isBusy ? await vpn.disconnect() : await vpn.connect() }
+                            focused = nil
+                            Task { if vpn.isConnected || vpn.isBusy { await vpn.disconnect() } else { await vpn.connect() } }
                         } label: {
                             Text(vpn.isConnected || vpn.isBusy ? "Disconnect" : "Connect")
                                 .frame(maxWidth: .infinity)
@@ -35,6 +39,7 @@ struct ContentView: View {
                                 .font(.footnote)
                                 .foregroundStyle(.red)
                                 .multilineTextAlignment(.center)
+                                .textSelection(.enabled)
                         }
                     }
                     .frame(maxWidth: .infinity)
@@ -46,17 +51,15 @@ struct ContentView: View {
                         .textContentType(.username)
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
-                        .focused($focused)
+                        .focused($focused, equals: .netID)
                     HStack {
                         SecureField(vpn.hasPassword ? "Password saved" : "Password", text: $password)
                             .textContentType(.password)
-                            .focused($focused)
-                        Button("Save") {
-                            vpn.savePassword(password)
-                            password = ""
-                            focused = false
-                        }
-                        .disabled(password.isEmpty)
+                            .focused($focused, equals: .password)
+                            .submitLabel(.done)
+                            .onSubmit(savePassword) // Return saves; otherwise the next Connect uses the old one
+                        Button("Save", action: savePassword)
+                            .disabled(password.isEmpty)
                     }
                 } header: {
                     Text("NYU account")
@@ -76,19 +79,17 @@ struct ContentView: View {
                     Button("Add Current Wi-Fi") {
                         Task {
                             if let ssid = await vpn.currentWiFi() { vpn.addAutoNetwork(ssid) }
-                            else { newNetwork = "" ; focused = true }
+                            else { focused = .network }
                         }
                     }
                     HStack {
                         TextField("Wi-Fi name", text: $newNetwork)
                             .autocorrectionDisabled()
                             .textInputAutocapitalization(.never)
-                            .focused($focused)
-                        Button("Add") {
-                            vpn.addAutoNetwork(newNetwork)
-                            newNetwork = ""
-                        }
-                        .disabled(newNetwork.trimmingCharacters(in: .whitespaces).isEmpty)
+                            .focused($focused, equals: .network)
+                            .onSubmit(addNetwork)
+                        Button("Add", action: addNetwork)
+                            .disabled(newNetwork.trimmingCharacters(in: .whitespaces).isEmpty)
                     }
                 } header: {
                     Text("Auto-connect")
@@ -103,7 +104,7 @@ struct ContentView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .keyboardType(.URL)
-                        .focused($focused)
+                        .focused($focused, equals: .server)
                 }
 
                 Section {
@@ -128,6 +129,20 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { vpn.refresh() } // e.g. back from approving in Duo
         }
+        .onChange(of: vpn.lastError) { _, error in
+            if let error { AccessibilityNotification.Announcement(error).post() } // so VoiceOver reads it out
+        }
+    }
+
+    private func savePassword() {
+        vpn.savePassword(password)
+        password = ""
+        focused = nil
+    }
+
+    private func addNetwork() {
+        vpn.addAutoNetwork(newNetwork)
+        newNetwork = ""
     }
 
     private var symbol: String {
@@ -164,8 +179,10 @@ struct ActivityView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .topBarTrailing) {
-                ShareLink(item: ([AppConfig.buildDescription] + lines).joined(separator: "\n")) { Image(systemName: "square.and.arrow.up") }
-                    .disabled(lines.isEmpty)
+                ShareLink(item: ([AppConfig.buildDescription] + lines).joined(separator: "\n")) {
+                    Label("Share", systemImage: "square.and.arrow.up").labelStyle(.iconOnly) // named for VoiceOver
+                }
+                .disabled(lines.isEmpty)
                 Button("Clear") {
                     ActivityLog.clear()
                     lines = []

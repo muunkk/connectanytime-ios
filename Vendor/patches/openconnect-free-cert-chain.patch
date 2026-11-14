@@ -1,0 +1,14 @@
+--- a/openssl.c
++++ b/openssl.c
+@@ -1638,6 +1638,11 @@
+ 	if (!cert_list_size)
+ 		return -EIO;
+ 
++	/* openconnect_free_peer_cert_chain() frees this many DER buffers. Only the
++	 * GnuTLS build set it, so with OpenSSL every call leaked the whole chain:
++	 * here, on each TLS handshake, since the caller verifies the certificate. */
++	vpninfo->cert_list_size = cert_list_size;
++
+ 	p = chain = calloc(cert_list_size, sizeof(struct oc_cert));
+ 	if (!chain)
+ 		return -ENOMEM;

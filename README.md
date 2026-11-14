@@ -10,8 +10,9 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
 
 ## Features
 
-- **Connect / Disconnect** in the app, from a **Control Center** toggle (filled when
-  connected), or with Siri, Shortcuts and the Action button.
+- **Connect / Disconnect** in the app, from a **Control Center** toggle (filled while
+  connecting or connected; its label says which), or with Siri, Shortcuts and the
+  Action button.
 - **Stay Connected** (on by default), like Cisco's AnyConnect. After you connect, iOS
   starts the VPN again whenever it drops, on any network, and it rejoins the session
   you already have: no new login, no Duo. Once the server has ended the session, it
@@ -101,6 +102,29 @@ open ConnectAnytime.xcodeproj
 The bundle IDs use `com.muunkk.*`. To build under your own team, change them in
 `project.yml`, and change `tunnelBundleID` and `controlKind` in `Shared/Shared.swift` to
 match.
+
+Run `Vendor/build-deps.sh` again whenever `Vendor/patches` changes. It rebuilds
+OpenConnect only if they did. Until you do, the tunnel's build stops with an error
+rather than link the old library.
+
+### Tests and the Simulator
+
+```sh
+xcodebuild test -project ConnectAnytime.xcodeproj -scheme ConnectAnytimeTests \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro'
+```
+
+The unit tests cover logic that needs no VPN or Keychain, and run on the Simulator
+without the app or the libraries above.
+
+A VPN can't run in the Simulator, but the whole app builds for it once the libraries
+exist for it too (Apple silicon Macs only):
+
+```sh
+Vendor/build-deps.sh simulator   # into Vendor/out-sim
+xcodebuild build -project ConnectAnytime.xcodeproj -scheme ConnectAnytime \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' CODE_SIGNING_ALLOWED=NO
+```
 
 ## Licenses
 

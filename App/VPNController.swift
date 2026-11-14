@@ -35,6 +35,9 @@ final class VPNController: ObservableObject {
     /// New on-demand rules wait while the VPN is connecting: saving the configuration
     /// then can restart the attempt, which means another Duo push.
     private var rulesSavePending = false
+    /// Counts the tunnel starts Connect makes, so the error of an attempt one replaced,
+    /// which arrives late, isn't shown under the new login.
+    private var starts = 0
     /// Bump when onDemandRules() changes, so existing installs pick up the new rules.
     private static let onDemandRulesVersion = 2
 
@@ -51,6 +54,9 @@ final class VPNController: ObservableObject {
     func load() async {
         guard manager == nil else { return }
         let existing = (try? await NETunnelProviderManager.loadAllFromPreferences())?.first
+        // Another caller (the view, or an intent at launch) may have loaded it meanwhile;
+        // a second manager would add a second status observer.
+        guard manager == nil else { return }
         manager = existing ?? NETunnelProviderManager()
         observeStatus()
         if existing != nil, UserDefaults.standard.integer(forKey: "onDemandRulesVersion") < Self.onDemandRulesVersion {
@@ -68,14 +74,22 @@ final class VPNController: ObservableObject {
 
     // MARK: Actions
 
-    func connect() async {
+    /// Returns why it didn't go ahead when it refused or couldn't start: Siri and Shortcuts
+    /// report that, since nobody sees `lastError` there. Only this Connect's own reason,
+    /// not an error left by an attempt it didn't start. Nil, too, when it leaves an attempt
+    /// already under way (see `mayStartLogin`): one waiting for Duo, or iOS's rejoin.
+    @discardableResult
+    func connect() async -> String? {
         lastError = nil
         await load()
-        guard !netID.trimmingCharacters(in: .whitespaces).isEmpty else { return lastError = "Enter your NetID first." }
-        guard hasPassword else { return lastError = "Save your password first." }
-        guard ![.connected, .reasserting].contains(status) else { return }
+        guard ![.connected, .reasserting].contains(status) else { return nil } // nothing to ask for
+        // An emptied Server field would be saved as the address, and kept.
+        if server.trimmingCharacters(in: .whitespaces).isEmpty { server = AppConfig.defaultServer }
+        guard !netID.trimmingCharacters(in: .whitespaces).isEmpty else { return refuse("Enter your NetID first.") }
+        guard hasPassword else { return refuse("Save your password first.") }
         ConnectIntent.set(disconnected: false)
         var started: NEVPNConnection?
+        var refusal: String?
         await inOrder {
             guard let m = self.manager else { return }
             guard await self.mayStartLogin(m) else { return }
@@ -88,8 +102,14 @@ final class VPNController: ObservableObject {
                 switch settled {
                 case .connected, .reasserting: return
                 case .disconnected, .invalid: break
-                default: return self.lastError = "The last attempt is still stopping. Tap Connect again in a moment."
+                default:
+                    refusal = self.refuse("The last attempt is still stopping. Tap Connect again in a moment.")
+                    return
                 }
+                // From here an error is this login's; one from the attempt it replaced may
+                // have landed meanwhile (see starts).
+                self.lastError = nil
+                self.starts += 1
                 // Auto-connect stays off until the VPN is up (see armOnDemandIfConnected).
                 try (m.connection as? NETunnelProviderSession)?
                     .startTunnel(options: [AppConfig.manualStartKey: true as NSNumber])
@@ -97,10 +117,16 @@ final class VPNController: ObservableObject {
                 await VPNQuickControl.wait(m.connection, whileIn: [.disconnected, .invalid])
                 started = m.connection
             } catch {
-                self.lastError = error.localizedDescription
+                refusal = self.refuse(error.localizedDescription)
             }
         }.value
         if let started { armWhenConnected(started) }
+        return refusal
+    }
+
+    private func refuse(_ message: String) -> String {
+        lastError = message
+        return message
     }
 
     /// Turns Stay Connected on once this login is through. Approving Duo usually means
@@ -175,6 +201,7 @@ final class VPNController: ObservableObject {
     /// right away. The next Connect turns them back on.
     func disconnect() async {
         lastError = nil
+        await load()
         guard let m = manager else { return }
         ConnectIntent.set(disconnected: true)
         await inOrder {
@@ -185,15 +212,18 @@ final class VPNController: ObservableObject {
         }.value
     }
 
-    func toggle() async {
+    /// As `connect`: why it didn't go ahead, if it chose Connect and that refused.
+    func toggle() async -> String? {
         await load()
-        if isConnected || isBusy { await disconnect() } else { await connect() }
+        if isConnected || isBusy { await disconnect(); return nil }
+        return await connect()
     }
 
     func savePassword(_ password: String) {
         guard !password.isEmpty else { return }
-        hasPassword = SharedKeychain.save(password)
-        if !hasPassword { lastError = "Couldn't save the password to the Keychain." }
+        let saved = SharedKeychain.save(password)
+        hasPassword = saved || SharedKeychain.hasPassword // a failed write keeps the old one
+        lastError = saved ? nil : "Couldn't save the password to the Keychain."
     }
 
     func addAutoNetwork(_ ssid: String) {
@@ -210,9 +240,7 @@ final class VPNController: ObservableObject {
 
     /// The Wi-Fi network the phone is on now (needs the VPN configuration to exist).
     func currentWiFi() async -> String? {
-        await withCheckedContinuation { cont in
-            NEHotspotNetwork.fetchCurrent { cont.resume(returning: $0?.ssid) }
-        }
+        await NEHotspotNetwork.fetchCurrent()?.ssid
     }
 
     // MARK: Configuration
@@ -318,16 +346,23 @@ final class VPNController: ObservableObject {
         guard let m = manager else { return }
         let old = status
         status = m.connection.status
+        // Up again, e.g. by Stay Connected: an earlier drop's error is over. Only as it
+        // comes up, so an error about something else (a failed password save) stays.
+        if status == .connected, old != .connected { lastError = nil }
         if status != .connecting, rulesSavePending {
             rulesSavePending = false
             inOrder { await self.applyOnDemand() }
         }
-        if VPNQuickControl.mayArm(status) { armOnDemandIfConnected() }
+        armOnDemandIfConnected()
         if [.disconnected, .connecting].contains(status) { disarmIfNothingToRejoin() }
         VPNQuickControl.reloadControl()
         if status == .disconnected, old != .disconnected {
+            let start = starts
             m.connection.fetchLastDisconnectError { error in
                 Task { @MainActor in
+                    // Not this attempt's if a Connect has since replaced it, and it's over if
+                    // the VPN is already back.
+                    guard self.starts == start, self.status != .connected else { return }
                     if let error, (error as NSError).domain != NEVPNConnectionErrorDomain || (error as NSError).code != 0 {
                         self.lastError = error.localizedDescription
                     }

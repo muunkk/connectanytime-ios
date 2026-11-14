@@ -52,8 +52,29 @@ targets:
         SWIFT_OBJC_BRIDGING_HEADER: Tunnel/Tunnel-Bridging-Header.h
         HEADER_SEARCH_PATHS: "$(SRCROOT)/Vendor/out/include"
         LIBRARY_SEARCH_PATHS: "$(SRCROOT)/Vendor/out/lib"
+        # The libraries built by `Vendor/build-deps.sh simulator`.
+        "HEADER_SEARCH_PATHS[sdk=iphonesimulator*]": "$(SRCROOT)/Vendor/out-sim/include"
+        "LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]": "$(SRCROOT)/Vendor/out-sim/lib"
         OTHER_LDFLAGS: "-lopenconnect -lssl -lcrypto -lxml2 -lz -liconv"
         ENABLE_BITCODE: NO
+        # The patch check below reads Vendor/patches and Vendor/out*, which a sandboxed
+        # script can't.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO
+    preBuildScripts:
+      # Xcode never runs build-deps.sh, so stop a build that would link libraries made
+      # without the current OpenConnect patches.
+      - name: Check OpenConnect patches
+        shell: /bin/zsh
+        basedOnDependencyAnalysis: false
+        script: |
+          cd "$SRCROOT/Vendor"
+          if [[ "$PLATFORM_NAME" == iphonesimulator ]]; then out=out-sim arg=" simulator"; else out=out arg=""; fi
+          patches=(patches/openconnect-*.patch(N))
+          want=$(cat "${patches[@]}" </dev/null | shasum -a 256 | awk '{print $1}')
+          if [[ "$(cat "$out/lib/openconnect-patches.sha256" 2>/dev/null)" != "$want" ]]; then
+            echo "error: Vendor/$out was built without the current OpenConnect patches. Run Vendor/build-deps.sh$arg."
+            exit 1
+          fi
     info:
       path: Tunnel/Info.plist
       properties:
@@ -90,3 +111,24 @@ targets:
       properties:
         com.apple.developer.networking.networkextension: [packet-tunnel-provider]
         keychain-access-groups: ["$(KEYCHAIN_GROUP)"]
+  # Unit tests for logic that needs no VPN, Keychain or host app. The sources under
+  # test are compiled into the bundle, so it runs on the Simulator without the app.
+  ConnectAnytimeTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - Tests
+      - Tunnel/SplitRoute.swift
+      - Tunnel/RefusedStarts.swift
+      - Shared/Shared.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.muunkk.connectanytime.tests
+        GENERATE_INFOPLIST_FILE: YES
+schemes:
+  ConnectAnytimeTests:
+    build:
+      targets:
+        ConnectAnytimeTests: [test]
+    test:
+      targets: [ConnectAnytimeTests]
