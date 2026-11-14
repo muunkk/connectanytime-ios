@@ -17,13 +17,21 @@ enum VPNQuickControl {
         try? await NETunnelProviderManager.loadAllFromPreferences().first
     }
 
-    /// On while connected or on the way there (e.g. waiting for Duo). Not for an
-    /// automatic attempt with no session to rejoin, which can only fail, so a tap
+    enum ToggleState { case off, connecting, connected }
+
+    /// The toggle is on while connected or on the way there (e.g. waiting for Duo). Not
+    /// for an automatic attempt with no session to rejoin, which can only fail, so a tap
     /// takes over and logs in instead of turning it off.
-    static func isOn() async -> Bool {
-        guard let m = await manager() else { return false }
-        if isHopelessAutoAttempt(m) { return false }
-        return [.connected, .connecting, .reasserting].contains(m.connection.status)
+    static func state() async -> ToggleState {
+        guard let m = await manager() else { return .off }
+        if isHopelessAutoAttempt(m) { return .off }
+        switch m.connection.status {
+        case .connecting: return .connecting
+        // Reconnecting reads as connected, as it always has: nothing refreshes the
+        // toggle once it's back, so it would go on saying it was connecting.
+        case .connected, .reasserting: return .connected
+        default: return .off
+        }
     }
 
     /// iOS's automatic attempt (manual logins save on-demand off first) with no saved

@@ -206,6 +206,9 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
                 RefusedStarts.clearNotification()
                 self.sessionLock.withLock { if !self._stopping { RunMarker.set() } } // see stopTunnel
                 done(nil)
+                // The toggle says "Connecting…" until it reads the VPN as up, which iOS may
+                // only report a moment after done's refresh.
+                DispatchQueue.global().asyncAfter(deadline: .now() + 1) { VPNQuickControl.reloadControl() }
                 self.queue.async {
                     self.tunFD = fd
                     self.watchNetwork()

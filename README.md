@@ -10,8 +10,9 @@ Sister project: [ConnectAnytime for macOS](https://github.com/muunkk/connectanyt
 
 ## Features
 
-- **Connect / Disconnect** in the app, from a **Control Center** toggle (filled when
-  connected), or with Siri, Shortcuts and the Action button.
+- **Connect / Disconnect** in the app, from a **Control Center** toggle (filled while
+  connecting or connected; its label says which), or with Siri, Shortcuts and the
+  Action button.
 - **Stay Connected** (on by default), like Cisco's AnyConnect. After you connect, iOS
   starts the VPN again whenever it drops, on any network, and it rejoins the session
   you already have: no new login, no Duo. Once the server has ended the session, it
