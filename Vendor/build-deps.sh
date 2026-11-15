@@ -1,6 +1,10 @@
 #!/bin/zsh
 # Build OpenSSL + libopenconnect as static libraries for iOS devices (arm64).
 # Output: Vendor/out/{include,lib}. Sources are downloaded into Vendor/src.
+#
+# `Vendor/build-deps.sh simulator` builds them for the iOS Simulator on an Apple
+# silicon Mac instead, into Vendor/out-sim, which the Xcode project uses for
+# Simulator builds. A VPN can't run there, but everything compiles and links.
 set -euo pipefail
 cd "${0:A:h}"
 OPENSSL=openssl-3.5.9
@@ -10,8 +14,16 @@ OPENCONNECT=openconnect-9.21
 OPENSSL_SHA256=603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a
 OPENCONNECT_SHA256=5b32369467db6e5f317aa1ed12cfcbb81ed00bdbc765450b6bfcbdc300944a58
 MIN_IOS=18.4
-SDK=$(xcrun --sdk iphoneos --show-sdk-path)
-OUT=$PWD/out
+case "${1:-device}" in
+  device)
+    SDK_NAME=iphoneos OUT=$PWD/out OPENSSL_TARGET=ios64-xcrun
+    OPENSSL_MIN=-mios-version-min=$MIN_IOS CC_MIN=-miphoneos-version-min=$MIN_IOS ;;
+  simulator)
+    SDK_NAME=iphonesimulator OUT=$PWD/out-sim OPENSSL_TARGET=iossimulator-arm64-xcrun
+    OPENSSL_MIN=-mios-simulator-version-min=$MIN_IOS CC_MIN=-mios-simulator-version-min=$MIN_IOS ;;
+  *) echo "usage: $0 [device|simulator]"; exit 2 ;;
+esac
+SDK=$(xcrun --sdk $SDK_NAME --show-sdk-path)
 JOBS=$(sysctl -n hw.ncpu)
 mkdir -p src "$OUT"
 
@@ -25,8 +37,8 @@ if [[ ! -f "$OUT/lib/libssl.a" ]]; then
   fetch "https://github.com/openssl/openssl/releases/download/$OPENSSL/$OPENSSL.tar.gz" "$OPENSSL.tar.gz" "$OPENSSL_SHA256"
   rm -rf "src/$OPENSSL" && tar -xzf "src/$OPENSSL.tar.gz" -C src
   (cd "src/$OPENSSL" &&
-    ./Configure ios64-xcrun no-shared no-tests no-apps no-docs no-engine no-async no-module \
-      --prefix="$OUT" --openssldir=/var/empty -mios-version-min=$MIN_IOS &&
+    ./Configure $OPENSSL_TARGET no-shared no-tests no-apps no-docs no-engine no-async no-module \
+      --prefix="$OUT" --openssldir=/var/empty $OPENSSL_MIN &&
     make -j"$JOBS" build_libs >/dev/null && make install_dev >/dev/null)
 fi
 
@@ -39,8 +51,8 @@ if [[ ! -f "$OUT/lib/libopenconnect.a" || "$(cat "$STAMP" 2>/dev/null)" != "$PAT
   fetch "https://www.infradead.org/openconnect/download/$OPENCONNECT.tar.gz" "$OPENCONNECT.tar.gz" "$OPENCONNECT_SHA256"
   rm -rf "src/$OPENCONNECT" && tar -xzf "src/$OPENCONNECT.tar.gz" -C src
   for p in "${PATCHES[@]}"; do patch -d "src/$OPENCONNECT" -p1 --forward < "$p"; done
-  CC="$(xcrun --sdk iphoneos -f clang)"
-  CFLAGS="-arch arm64 -isysroot $SDK -miphoneos-version-min=$MIN_IOS -O2"
+  CC="$(xcrun --sdk $SDK_NAME -f clang)"
+  CFLAGS="-arch arm64 -isysroot $SDK $CC_MIN -O2"
   (cd "src/$OPENCONNECT" &&
     PKG_CONFIG_PATH="$OUT/lib/pkgconfig" PKG_CONFIG_LIBDIR="$OUT/lib/pkgconfig" \
     CC="$CC" CFLAGS="$CFLAGS" LDFLAGS="-arch arm64 -isysroot $SDK" \

@@ -4,6 +4,7 @@
 #include <Security/Security.h>
 #include <errno.h>
 #include <netdb.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdbool.h>
@@ -32,11 +33,28 @@ struct ocb_session {
     char first_error[256]; // OpenConnect's first error in ocb_connect, to say why it failed
     char *connect_url;
     char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
+    // The server's name and the address the session was made on, which a rejoin pins.
+    // Settled once, by ocb_connect or ocb_resume: a reconnect may be to another address,
+    // and on an IPv6-only network to one that only works there (NAT64).
+    char *made_name, *made_ip;
+    char limits_logged[6][64]; // the session limits last logged, in log_server_limits' order
+    // What ocb_resume needs to rejoin the session, copied on the thread that's running
+    // OpenConnect: a reconnect replaces the cookie there (openconnect-strap-cookie.patch)
+    // while ocb_session_saved reads on another.
+    pthread_mutex_t saved_lock;
+    ocb_saved saved;
+    ocb_save_fn save;
+    bool running; // in ocb_run's mainloop; only touched on its thread
 };
 
 enum { LOGIN_IDLE, LOGIN_SENDING_SECRETS, LOGIN_ABORTED };
 
 static void reconnected_cb(void *priv);
+static void session_changed_cb(void *priv);
+static void snapshot_saved(ocb_session *s);
+static void settle_address(ocb_session *s);
+static char *dup_or_null(const char *v);
+static void wipe_free(char *p);
 
 static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
     if (!s->log) return;
@@ -48,6 +66,26 @@ static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
     size_t n = strlen(buf);
     while (n && (buf[n - 1] == '\n' || buf[n - 1] == '\r')) buf[--n] = 0;
     if (n) s->log(s->ctx, level, buf);
+}
+
+// The server's limits on the session (how long it may last, sit idle, or wait for
+// the phone to come back), from the CONNECT reply's headers, which OpenConnect keeps
+// as the session's options. Only these: other options can hold the session cookie.
+// (It also reports the headers as progress, but at DEBUG, which stays off.)
+static void log_server_limits(struct ocb_session *s) {
+    static const char *limits[] = { "X-CSTP-Lease-Duration", "X-CSTP-Session-Timeout",
+        "X-CSTP-Session-Timeout-Remaining", "X-CSTP-Idle-Timeout",
+        "X-CSTP-Disconnected-Timeout", "X-CSTP-Session-Timeout-Alert-Interval", NULL };
+    const struct oc_vpn_option *opt = NULL;
+    if (openconnect_get_ip_info(s->vpn, NULL, &opt, NULL)) return;
+    // Only the ones that changed since they were last logged, so reconnects through
+    // the night don't push older lines out of the Activity log.
+    for (; opt; opt = opt->next)
+        for (int i = 0; opt->option && opt->value && limits[i]; i++)
+            if (!strcasecmp(opt->option, limits[i]) && strcmp(s->limits_logged[i], opt->value)) {
+                snprintf(s->limits_logged[i], sizeof s->limits_logged[i], "%s", opt->value);
+                logf_(s, PRG_INFO, "Server limit %s: %s", opt->option + 7, opt->value);
+            }
 }
 
 // OpenConnect progress. Capped at PRG_INFO: DEBUG/TRACE dump HTTP bodies,
@@ -62,21 +100,6 @@ static void progress_cb(void *priv, int level, const char *fmt, ...) {
     else if (s->event && (!strncmp(fmt, "CSTP Dead Peer Detection detected dead peer", 43) ||
                           !strncmp(fmt, "sleep %ds", 9)))
         s->event(s->ctx, OCB_RECONNECTING, NULL);
-    // The server's limits on the session (how long it may last, sit idle, or wait for
-    // the phone to come back), from the CONNECT reply's headers. Only these: other
-    // DEBUG lines can hold the password or cookie.
-    if (level == PRG_DEBUG && !strcmp(fmt, "%s: %s\n")) {
-        static const char *limits[] = { "X-CSTP-Lease-Duration", "X-CSTP-Session-Timeout",
-            "X-CSTP-Session-Timeout-Remaining", "X-CSTP-Idle-Timeout",
-            "X-CSTP-Disconnected-Timeout", "X-CSTP-Session-Timeout-Alert-Interval", NULL };
-        va_list ap;
-        va_start(ap, fmt);
-        const char *name = va_arg(ap, const char *), *value = va_arg(ap, const char *);
-        va_end(ap);
-        for (int i = 0; name && value && limits[i]; i++)
-            if (!strcasecmp(name, limits[i])) logf_(s, PRG_INFO, "Server limit %s: %s", name + 7, value);
-        return;
-    }
     if (level > PRG_INFO) return;
     char buf[1024];
     va_list ap;
@@ -149,7 +172,7 @@ static int validate_cert_cb(void *priv, const char *reason) {
     if (n <= 0) return 1;
 
     CFMutableArrayRef certs = CFArrayCreateMutable(NULL, n, &kCFTypeArrayCallBacks);
-    for (int i = 0; i < n; i++) {
+    for (int i = 0; certs && i < n; i++) {
         CFDataRef der = CFDataCreate(NULL, chain[i].der_data, chain[i].der_len);
         SecCertificateRef c = der ? SecCertificateCreateWithData(NULL, der) : NULL;
         if (c) { CFArrayAppendValue(certs, c); CFRelease(c); }
@@ -159,11 +182,12 @@ static int validate_cert_cb(void *priv, const char *reason) {
 
     // get_hostname() can return the resolved IP; the certificate is issued to the DNS name.
     const char *hostname = openconnect_get_dnsname(s->vpn);
-    CFStringRef host = CFStringCreateWithCString(NULL, hostname ? hostname : "", kCFStringEncodingUTF8);
-    SecPolicyRef policy = SecPolicyCreateSSL(true, host);
+    CFStringRef host = hostname && *hostname
+        ? CFStringCreateWithCString(NULL, hostname, kCFStringEncodingUTF8) : NULL;
+    SecPolicyRef policy = host ? SecPolicyCreateSSL(true, host) : NULL;
     SecTrustRef trust = NULL;
     CFErrorRef trustError = NULL;
-    OSStatus created = CFArrayGetCount(certs) > 0
+    OSStatus created = certs && host && policy && CFArrayGetCount(certs) > 0
         ? SecTrustCreateWithCertificates(certs, policy, &trust) : errSecParam;
     bool ok = created == errSecSuccess && SecTrustEvaluateWithError(trust, &trustError);
     char why[160] = "";
@@ -173,7 +197,7 @@ static int validate_cert_cb(void *priv, const char *reason) {
         CFRelease(trustError);
     }
     if (trust) CFRelease(trust);
-    CFRelease(policy);
+    if (policy) CFRelease(policy);
     if (host) CFRelease(host);
 
     if (ok) logf_(s, PRG_INFO, "Server certificate verified by iOS");
@@ -181,9 +205,9 @@ static int validate_cert_cb(void *priv, const char *reason) {
         logf_(s, PRG_ERR, "Server certificate rejected (%s)", reason ? reason : "untrusted");
         snprintf(s->auth_error, sizeof s->auth_error,
                  "The server's certificate isn't trusted (%d certs from %d, host %s, status %d). %s",
-                 (int)CFArrayGetCount(certs), n, hostname ? hostname : "?", (int)created, why);
+                 (int)(certs ? CFArrayGetCount(certs) : 0), n, hostname ? hostname : "?", (int)created, why);
     }
-    CFRelease(certs);
+    if (certs) CFRelease(certs);
     return ok ? 0 : 1;
 }
 
@@ -204,10 +228,12 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
 
     struct ocb_session *s = calloc(1, sizeof *s);
     if (!s) return NULL;
+    pthread_mutex_init(&s->saved_lock, NULL);
     s->server = strdup(server);
     s->user = strdup(user);
     s->password = strdup(password);
     s->second = strdup(second_password);
+    if (!s->server || !s->user || !s->password || !s->second) { ocb_free(s); return NULL; }
     s->log = log;
     s->event = event;
     s->ctx = ctx;
@@ -216,7 +242,9 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     openconnect_set_loglevel(s->vpn, PRG_INFO);
     openconnect_set_reported_os(s->vpn, "apple-ios");
     openconnect_set_reconnected_handler(s->vpn, reconnected_cb);
+    openconnect_set_session_changed_handler(s->vpn, session_changed_cb);
     s->cmd_fd = openconnect_setup_cmd_pipe(s->vpn);
+    if (s->cmd_fd < 0) { ocb_free(s); return NULL; }
     return s;
 }
 
@@ -251,6 +279,9 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Logged in, but couldn't open the VPN session.");
         return -1;
     }
+    settle_address(s);
+    snapshot_saved(s); // not the cookie from the login: that CONNECT gave the server a new key
+    log_server_limits(s);
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
         logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
@@ -291,6 +322,9 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
         snprintf(err, errlen, "Invalid saved session.");
         return OCB_SESSION_ENDED;
     }
+    // Saved again as they came: this connection may be to another of the server's addresses.
+    s->made_name = dup_or_null(dnsname);
+    s->made_ip = dup_or_null(ip);
     if (dnsname && *dnsname && ip && *ip) {
         size_t n = strlen(ip);
         bool bracketed = n > 2 && ip[0] == '[' && ip[n - 1] == ']'; // IPv6 as in a URL
@@ -306,6 +340,9 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
                                              : "Couldn't reach the VPN server.");
         return ret == -EPERM ? OCB_SESSION_ENDED : -1;
     }
+    settle_address(s); // what a session saved without them lacks
+    snapshot_saved(s);
+    log_server_limits(s);
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
     if (openconnect_setup_dtls(s->vpn, 60)) {
         logf_(s, PRG_INFO, "DTLS unavailable; using TLS only");
@@ -314,34 +351,96 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
     return 0;
 }
 
-const char *ocb_session_url(ocb_session *s) {
-    // openconnect_get_connect_url appends to its buffer on every call; ask once.
-    if (!s->connect_url) {
-        const char *url = openconnect_get_connect_url(s->vpn);
-        s->connect_url = url ? strdup(url) : NULL;
-    }
-    return s->connect_url;
-}
-
-const char *ocb_session_cookie(ocb_session *s) {
-    return openconnect_get_cookie(s->vpn);
-}
-
-const char *ocb_session_dnsname(ocb_session *s) {
-    return openconnect_get_dnsname(s->vpn);
-}
-
-const char *ocb_session_ip(ocb_session *s) {
-    return openconnect_get_hostname(s->vpn); // the address connected to, despite the name
-}
-
 static char *dup_or_null(const char *v) { return v && *v ? strdup(v) : NULL; }
+
+// The session is up on this connection: unless ocb_resume was given them, its name and
+// address are the ones to rejoin it on.
+static void settle_address(ocb_session *s) {
+    if (!s->made_name) s->made_name = dup_or_null(openconnect_get_dnsname(s->vpn));
+    // The address connected to, despite the name.
+    if (!s->made_ip) s->made_ip = dup_or_null(openconnect_get_hostname(s->vpn));
+}
+
+// Copies what ocb_resume needs out of OpenConnect. Only on the thread that's running
+// it: after ocb_connect or ocb_resume, whenever OpenConnect says the session's keys
+// changed (session_changed_cb), in reconnected_cb, and when ocb_run ends.
+static void snapshot_saved(ocb_session *s) {
+    // openconnect_get_connect_url appends to its buffer on every call; ask once.
+    if (!s->connect_url) s->connect_url = dup_or_null(openconnect_get_connect_url(s->vpn));
+    const char *cookie = openconnect_get_cookie(s->vpn); // with the key the server last accepted
+    // The key a CONNECT presented without an answer, if there is one: the server may hold it.
+    char *candidate = openconnect_strap_candidate_cookie(s->vpn);
+    // None for a cookie with a STRAP key means it couldn't be copied (out of memory):
+    // OpenConnect holds one whenever the cookie carries one.
+    static const char strap[] = "openconnect_strapkey=";
+    bool copied = candidate || !cookie || strncmp(cookie, strap, sizeof(strap) - 1);
+    if (candidate && (!cookie || !strcmp(candidate, cookie))) { wipe_free(candidate); candidate = NULL; }
+    // Until they're settled (a login's first CONNECT), where OpenConnect is now.
+    const char *dnsname = s->made_name ? s->made_name : openconnect_get_dnsname(s->vpn);
+    const char *ip = s->made_ip ? s->made_ip : openconnect_get_hostname(s->vpn);
+    ocb_saved next = {
+        .url = dup_or_null(s->connect_url),
+        .cookie = dup_or_null(cookie),
+        .dnsname = dup_or_null(dnsname),
+        .ip = dup_or_null(ip),
+        .candidate = candidate,
+    };
+    // dup_or_null gives NULL for an empty string too. The address pin counts: without
+    // it, a rejoin can go to another gateway.
+    copied = copied && (next.url || !s->connect_url || !*s->connect_url)
+        && (next.cookie || !cookie || !*cookie)
+        && (next.dnsname || !dnsname || !*dnsname) && (next.ip || !ip || !*ip);
+    pthread_mutex_lock(&s->saved_lock);
+    // A snapshot missing what couldn't be copied would replace one that can rejoin:
+    // keep that one, unless there's none yet.
+    bool keep = !copied && s->saved.cookie;
+    ocb_saved old = keep ? next : s->saved;
+    if (!keep) s->saved = next;
+    pthread_mutex_unlock(&s->saved_lock);
+    ocb_saved_free(&old);
+}
+
+// On the thread that's running OpenConnect: a CONNECT is about to present a new key (the
+// request waits for this to return), or has got its 200 and the cookie carries the key
+// the server took (openconnect-strap-cookie.patch).
+static void session_changed_cb(void *priv) {
+    struct ocb_session *s = priv;
+    snapshot_saved(s);
+    // Only with the tunnel up. ocb_connect and ocb_resume leave saving to their caller,
+    // once they've returned: a login whose session didn't open isn't one to rejoin.
+    if (s->running && s->save) s->save(s->ctx, s);
+}
+
+void ocb_set_save_handler(ocb_session *s, ocb_save_fn save) { s->save = save; }
+
+int ocb_session_saved(ocb_session *s, ocb_saved *out) {
+    memset(out, 0, sizeof *out);
+    pthread_mutex_lock(&s->saved_lock);
+    const char *from[] = { s->saved.url, s->saved.cookie, s->saved.dnsname, s->saved.ip, s->saved.candidate };
+    char **to[] = { &out->url, &out->cookie, &out->dnsname, &out->ip, &out->candidate };
+    bool ok = from[0] && from[1]; // nothing to rejoin without the address and the cookie
+    for (size_t i = 0; ok && i < sizeof from / sizeof *from; i++)
+        ok = !from[i] || (*to[i] = strdup(from[i])) != NULL;
+    pthread_mutex_unlock(&s->saved_lock);
+    if (!ok) ocb_saved_free(out);
+    return ok ? 0 : -1;
+}
+
+void ocb_saved_free(ocb_saved *saved) {
+    wipe_free(saved->url);
+    wipe_free(saved->cookie);
+    wipe_free(saved->dnsname);
+    wipe_free(saved->ip);
+    wipe_free(saved->candidate);
+    memset(saved, 0, sizeof *saved);
+}
 
 static char *join_routes(struct oc_split_include *list) {
     size_t len = 0;
     for (struct oc_split_include *r = list; r; r = r->next) len += strlen(r->route) + 1;
     if (!len) return NULL;
     char *out = calloc(1, len + 1), *p = out;
+    if (!out) return NULL;
     for (struct oc_split_include *r = list; r; r = r->next) p += sprintf(p, "%s\n", r->route);
     return out;
 }
@@ -363,6 +462,13 @@ int ocb_get_config(ocb_session *s, ocb_config *out) {
     out->split_dns = join_routes(ip->split_dns);
     out->mtu = ip->mtu;
     out->key = config_key(out);
+    // A list that couldn't be copied mustn't read as an empty one: with no split
+    // includes the tunnel takes everything.
+    if (!out->key || (ip->split_includes && !out->split_includes) ||
+        (ip->split_excludes && !out->split_excludes) || (ip->split_dns && !out->split_dns)) {
+        ocb_config_free(out);
+        return -1;
+    }
     return 0;
 }
 
@@ -384,6 +490,8 @@ static char *config_key(const ocb_config *c) {
 static void reconnected_cb(void *priv) {
     struct ocb_session *s = priv;
     logf_(s, PRG_INFO, "Reconnected with the existing session");
+    snapshot_saved(s); // the server has a new key for the session, now in the cookie
+    log_server_limits(s); // they change: e.g. how much of the session's time is left
     ocb_config cfg;
     bool ok = ocb_get_config(s, &cfg) == 0 && cfg.key;
     if (s->event) s->event(s->ctx, OCB_RECONNECTED, ok ? &cfg : NULL);
@@ -402,9 +510,15 @@ void ocb_config_free(ocb_config *c) {
 int ocb_run(ocb_session *s, int tun_fd, int reconnect_timeout) {
     if (openconnect_setup_tun_fd(s->vpn, tun_fd)) return -1;
     int ret;
+    s->running = true; // from here on, session_changed_cb has the session saved
     // Only a pause makes the mainloop return 0 (it closes its connections first).
     // Calling it again reconnects with the session cookie: no new login or Duo push.
     while ((ret = openconnect_mainloop(s->vpn, reconnect_timeout, RECONNECT_INTERVAL_MIN)) == 0) {}
+    s->running = false;
+    // Its last reconnect may have got the server's 200 (so the server holds a new key)
+    // and then failed, or sent a new key and heard nothing back: keep both to save.
+    // (Already saved as each happened; this is what the caller reads once more.)
+    snapshot_saved(s);
     return ret;
 }
 
@@ -452,6 +566,10 @@ void ocb_free(ocb_session *s) {
     free(s->connect_url);
     free(s->pin_name);
     free(s->pin_ip);
+    free(s->made_name);
+    free(s->made_ip);
+    ocb_saved_free(&s->saved);
+    pthread_mutex_destroy(&s->saved_lock);
     free(s);
 }
 

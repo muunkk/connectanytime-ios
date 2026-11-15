@@ -13,13 +13,19 @@ struct ConnectAnytimeApp: App {
 
 // MARK: - Shortcuts, Siri, Action button
 
+/// Why Connect didn't go ahead. Otherwise Siri and Shortcuts report success, and the
+/// reason only shows in the app.
+struct ConnectFailed: LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
+}
+
 struct ConnectVPNIntent: AppIntent {
     static let title: LocalizedStringResource = "Connect NYU VPN"
     // Require Face ID / passcode when run from the lock screen or Siri on a locked phone.
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     func perform() async throws -> some IntentResult {
-        await VPNController.shared.load()
-        await VPNController.shared.connect()
+        if let refusal = await VPNController.shared.connect() { throw ConnectFailed(message: refusal) }
         return .result()
     }
 }
@@ -29,7 +35,6 @@ struct DisconnectVPNIntent: AppIntent {
     // Require Face ID / passcode when run from the lock screen or Siri on a locked phone.
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     func perform() async throws -> some IntentResult {
-        await VPNController.shared.load()
         await VPNController.shared.disconnect()
         return .result()
     }
@@ -40,7 +45,7 @@ struct ToggleVPNIntent: AppIntent {
     // Require Face ID / passcode when run from the lock screen or Siri on a locked phone.
     static let authenticationPolicy: IntentAuthenticationPolicy = .requiresAuthentication
     func perform() async throws -> some IntentResult {
-        await VPNController.shared.toggle()
+        if let refusal = await VPNController.shared.toggle() { throw ConnectFailed(message: refusal) }
         return .result()
     }
 }

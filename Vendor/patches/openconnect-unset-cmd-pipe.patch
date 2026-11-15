@@ -1,0 +1,12 @@
+--- a/library.c
++++ b/library.c
+@@ -196,6 +196,9 @@
+ 	vpninfo->dtls_fd = -1;
+ 	vpninfo->need_poll_cmd_fd = -1;
+ 	vpninfo->cmd_fd = -1;
++	/* Unset, like cmd_fd. Left at 0, a session whose command pipe was never set
++	 * up closed descriptor 0 when it was freed. */
++	vpninfo->cmd_fd_write = -1;
+ 	init_pkt_queue(&vpninfo->free_queue);
+ 	init_pkt_queue(&vpninfo->incoming_queue);
+ 	init_pkt_queue(&vpninfo->outgoing_queue);

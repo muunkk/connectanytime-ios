@@ -9,13 +9,15 @@ struct ConnectAnytimeWidgets: WidgetBundle {
     }
 }
 
-/// Control Center toggle: filled when connected, plain when not.
+/// Control Center toggle: filled when on (connected or on the way there), plain when
+/// not. On while connecting, so a tap stops it; its label says which.
 struct VPNControl: ControlWidget {
     var body: some ControlWidgetConfiguration {
-        StaticControlConfiguration(kind: AppConfig.controlKind, provider: Provider()) { isOn in
-            ControlWidgetToggle("NYU VPN", isOn: isOn, action: SetVPNIntent()) { on in
+        StaticControlConfiguration(kind: AppConfig.controlKind, provider: Provider()) { state in
+            ControlWidgetToggle("NYU VPN", isOn: state != .off, action: SetVPNIntent()) { on in
                 Label {
-                    Text(on ? "Connected" : "Off")
+                    // Right after a tap turns it on, `on` is true while `state` is still off.
+                    Text(!on ? "Off" : state == .connected ? "Connected" : "Connecting…")
                 } icon: {
                     // The network globe fills its whole frame; scale it down to sit
                     // like the other Control Center glyphs.
@@ -29,8 +31,8 @@ struct VPNControl: ControlWidget {
     }
 
     struct Provider: ControlValueProvider {
-        var previewValue: Bool { false }
-        func currentValue() async throws -> Bool { await VPNQuickControl.isOn() }
+        var previewValue: VPNQuickControl.ToggleState { .off }
+        func currentValue() async throws -> VPNQuickControl.ToggleState { await VPNQuickControl.state() }
     }
 }
 
