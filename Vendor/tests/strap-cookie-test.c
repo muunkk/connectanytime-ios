@@ -6,6 +6,11 @@
  * Checks 1 to 6 are ConnectAnytime for Android's test of the patch as it has it. 7 and
  * 8 test what this one adds: the handler a client saves the session from, and which key
  * signs a CONNECT that presents an unresolved key again. */
+#include <config.h>
+#include "openconnect-internal.h"
+/* Building the request fails (out of memory, a failed signature) when set. */
+static int fail_build;
+#define buf_error(b) (fail_build ? -ENOMEM : buf_error(b))
 #include "cstp.c" /* start_cstp_connection and strap_cookie are static */
 
 #include <openssl/evp.h>
@@ -199,7 +204,7 @@ static struct openconnect_info *logged_in(void)
 
 #ifndef WITHOUT_STRAP_PATCH
 /* What the session-changed handler found each time it was called. */
-static struct { int request_sent; char *cookie_key, *candidate_key; } seen[8];
+static struct { int request_sent; char *cookie_key, *candidate_key; } seen[16];
 static int changes;
 
 static void on_changed(void *priv)
@@ -207,7 +212,7 @@ static void on_changed(void *priv)
 	struct openconnect_info *vpninfo = priv;
 	char *candidate = openconnect_strap_candidate_cookie(vpninfo);
 
-	if (changes >= 8)
+	if (changes >= 16)
 		exit(2);
 	seen[changes].request_sent = sent[0] != 0;
 	seen[changes].cookie_key = resume_pubkey(vpninfo->cookie, NULL);
@@ -266,6 +271,9 @@ static void test_handler_and_signing(void)
 	connect_via(vpninfo, NULL, 0);
 	start_cstp_connection(vpninfo, 1);
 	presented = sent_pubkey();
+	CHECK(changes == 4 && !seen[3].request_sent && seen[3].candidate_key && presented &&
+	      !strcmp(seen[3].candidate_key, presented) && !strcmp(seen[3].cookie_key, first),
+	      "sending it again after an error, the handler runs first, with the same pair");
 	CHECK(presented && !strcmp(presented, second) && signed_by(first) && !signed_by(second),
 	      "after a 503, the same unresolved key, signed by the accepted one");
 	free(presented);
@@ -290,16 +298,17 @@ static void test_handler_and_signing(void)
 	presented = sent_pubkey();
 	CHECK(presented && !strcmp(presented, second) && signed_by(first) && !signed_by(second),
 	      "is sent again signed by the accepted key");
+	CHECK(changes == 5 && !seen[4].request_sent, "and the handler runs before it goes out");
 	free(presented);
 
 	/* Through all of that only one new key was ever presented, so the pair to save
-	 * never changed, and the handler had nothing to say. */
+	 * never changed: the handler only ran again before resending it. */
 	{
 		char *saved = resume_pubkey(vpninfo->cookie, NULL);
 		char *cand = openconnect_strap_candidate_cookie(vpninfo);
 		char *next = cand ? resume_pubkey(cand, NULL) : NULL;
-		CHECK(changes == 3 && saved && !strcmp(saved, first) && next && !strcmp(next, second),
-		      "the pair to save is still {accepted, unresolved}, and the handler wasn't called again");
+		CHECK(changes == 5 && saved && !strcmp(saved, first) && next && !strcmp(next, second),
+		      "the pair to save is still {accepted, unresolved}");
 		free(saved); free(cand); free(next);
 	}
 
@@ -308,8 +317,8 @@ static void test_handler_and_signing(void)
 	start_cstp_connection(vpninfo, 1);
 	{
 		char *saved = resume_pubkey(vpninfo->cookie, NULL);
-		CHECK(changes == 4 && saved && !strcmp(saved, second) && seen[3].cookie_key &&
-		      !strcmp(seen[3].cookie_key, second),
+		CHECK(changes == 6 && saved && !strcmp(saved, second) && seen[5].cookie_key &&
+		      !strcmp(seen[5].cookie_key, second),
 		      "a 200 settles it: the handler runs with the unresolved key in the cookie");
 		free(saved);
 	}
@@ -318,6 +327,22 @@ static void test_handler_and_signing(void)
 	presented = sent_pubkey();
 	CHECK(presented && strcmp(presented, second) && signed_by(second),
 	      "and the next CONNECT rekeys, signed by it");
+	free(presented);
+
+	/* A rekey whose request can't be built: the new key is made but nothing goes out.
+	 * The next CONNECT sends that key, so it has to be saved first then. */
+	CHECK(changes == 8, "that rekey ran the handler before it and at its 200");
+	connect_via(vpninfo, NULL, 0);
+	fail_build = 1;
+	start_cstp_connection(vpninfo, 1);
+	fail_build = 0;
+	CHECK(!sent[0] && changes == 8, "a rekey whose request can't be built sends nothing");
+	connect_via(vpninfo, NULL, 0);
+	start_cstp_connection(vpninfo, 1);
+	presented = sent_pubkey();
+	CHECK(changes == 9 && !seen[8].request_sent && presented && seen[8].candidate_key &&
+	      !strcmp(seen[8].candidate_key, presented) && strcmp(presented, second),
+	      "the next CONNECT presents that key, and the handler saves it before it goes out");
 	free(presented);
 }
 #endif

@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// What rejoining the last session takes: the server's address after any redirects,
@@ -28,8 +29,11 @@ extension SavedSession {
         self = session
     }
 
+    /// Keys sorted, so the same session always encodes the same (SessionStore compares).
     var json: String? {
-        (try? JSONEncoder().encode(self)).map { String(decoding: $0, as: UTF8.self) }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return (try? encoder.encode(self)).map { String(decoding: $0, as: UTF8.self) }
     }
 
     /// Rejoins the session. `attempt` presents one cookie to the server and returns what
@@ -71,7 +75,9 @@ final class SessionStore {
     private let write: (String) -> Bool
     private let delete: () -> Void
     private var loggedOut = false
-    private var written: SavedSession? // what the last save left there, to not write it again
+    /// A digest of what the last save left there, to not write it again. Not the session
+    /// itself, so the store keeps no copy of its cookies.
+    private var written: SHA256.Digest?
     private var failing = false
 
     init(read: @escaping () -> String?, write: @escaping (String) -> Bool, delete: @escaping () -> Void) {
@@ -89,12 +95,13 @@ final class SessionStore {
         lock.withLock {
             guard !loggedOut else { return .loggedOut }
             guard let session = current(), let json = session.json else { return .nothing }
-            guard session != written else { return .unchanged }
+            let digest = SHA256.hash(data: Data(json.utf8))
+            guard digest != written else { return .unchanged }
             guard write(json) else {
                 defer { failing = true }
                 return .failed(first: !failing)
             }
-            written = session
+            written = digest
             failing = false
             return .written
         }

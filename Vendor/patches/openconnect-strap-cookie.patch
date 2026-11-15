@@ -135,7 +135,7 @@ index b071174..896e7b1 100644
 +		append_connect_strap_headers(vpninfo, reqbuf, rekey ? 1 : resend ? 2 : 0);
 +		if (rekey || vpninfo->strap_unresolved)
 +			vpninfo->strap_unresolved = STRAP_UNANSWERED;
-+		new_strap_key = rekey;
++		new_strap_key = rekey || resend; /* resend: its first request may never have gone */
 +	}
  #endif
  
@@ -152,7 +152,7 @@ index b071174..896e7b1 100644
  		dump_buf(vpninfo, '>', reqbuf->data);
  
 -	vpninfo->ssl_write(vpninfo, reqbuf->data, reqbuf->pos);
-+	/* About to hand the server a new STRAP key: let the client save it first. */
++	/* About to hand the server a key it may not hold yet: let the client save it first. */
 +	if (new_strap_key && vpninfo->session_changed)
 +		vpninfo->session_changed(vpninfo->cbdata);
 +
