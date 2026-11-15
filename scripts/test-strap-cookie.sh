@@ -50,8 +50,9 @@ build() {
 cookie_test() {
   local oc="$HOST/$1/openconnect-9.21" out="$HOST/$1/strap-cookie-test"
   shift
+  rm -f "$out" # never one from an earlier build
   /usr/bin/clang -Wall -Wno-unused-function "$@" -I"$oc" -I"$oc/json" -I"$OSSL/include" -I"$SDK/usr/include/libxml2" \
-    tests/strap-cookie-test.c "$oc/.libs/libopenconnect.a" -L"$OSSL/lib" -lssl -lcrypto -lxml2 -lz -liconv -o "$out"
+    tests/strap-cookie-test.c "$oc/.libs/libopenconnect.a" -L"$OSSL/lib" -lssl -lcrypto -lxml2 -lz -liconv -o "$out" || return 2
   "$out"
 }
 
@@ -60,14 +61,15 @@ cookie_test() {
 bridge_test() {
   local oc="$HOST/$1/openconnect-9.21" out="$HOST/$1/bridge-session-test"
   shift
+  rm -f "$out"
   /usr/bin/clang -g -Wall -Wno-unused-function -Wno-deprecated-declarations "$@" -I../Tunnel -I"$oc" -I"$OSSL/include" \
     tests/bridge-session-test.c "$oc/.libs/libopenconnect.a" -L"$OSSL/lib" -lssl -lcrypto -lxml2 -lz -liconv \
-    -framework Security -framework CoreFoundation -o "$out"
+    -framework Security -framework CoreFoundation -o "$out" || return 2
   "$out"
 }
 
 # must_fail <test> <name> [flag]...: 1 is a test's own "checks failed"; anything else is a
-# crash or a broken build.
+# crash or a build that failed (2, so it can't pass for a failed check).
 must_fail() {
   local code=0
   "$@" || code=$?

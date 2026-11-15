@@ -62,11 +62,23 @@ typedef struct {
     char *candidate;          // NULL if none
 } ocb_saved;
 
-/// The session as of the last ocb_connect, ocb_resume or reconnect, or the end of
-/// ocb_run. Thread-safe: `out` gets copies, since a reconnect in ocb_run replaces the
-/// cookie. 0 on success; then free them with ocb_saved_free.
+/// The session as it stands: as of the last ocb_connect or ocb_resume, and in ocb_run
+/// as of the last request that presented a new key or got the server's 200.
+/// Thread-safe: `out` gets copies, since a reconnect in ocb_run replaces the cookie.
+/// `dnsname` and `ip` stay those the session was made on, whatever address a reconnect
+/// reached. 0 on success; then free them with ocb_saved_free.
 int ocb_session_saved(ocb_session *s, ocb_saved *out);
 void ocb_saved_free(ocb_saved *saved);
+
+/// Called in ocb_run, on its thread, each time what ocb_session_saved returns changes:
+/// just before a reconnect's request hands the server a new key (now the `candidate`),
+/// and when the server answers 200 (the key it took is now in `cookie`). The request
+/// isn't sent until this returns, so a handler that saves the session has the new key
+/// stored before the server can hold it: iOS can end the extension at any moment, such
+/// as while that request waits for its answer. It must not wait for anything that waits
+/// for ocb_run. Set it before ocb_run.
+typedef void (*ocb_save_fn)(void *ctx, ocb_session *s);
+void ocb_set_save_handler(ocb_session *s, ocb_save_fn save);
 
 int ocb_get_config(ocb_session *s, ocb_config *out);
 void ocb_config_free(ocb_config *c);

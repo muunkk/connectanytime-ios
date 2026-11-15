@@ -5,10 +5,13 @@
  * that CONNECT presented. A CONNECT that fails that gets 401, as a rejoin from a session
  * saved at login did on the phone.
  *
- * That the real ASA works like this is an assumption. What this shows is that, against
- * such a server, a fresh ocb_resume from ocb_session_saved's snapshot is accepted after
- * a login, after every reconnect, and after a CONNECT that went unanswered (through the
- * candidate), and that the snapshot can be read while ocb_run reconnects.
+ * That the real ASA works like this is an assumption, as is that its 401 for a key it
+ * doesn't hold leaves the session open. What this shows is that, against such a server,
+ * a fresh ocb_resume from ocb_session_saved's snapshot is accepted after a login, after
+ * every reconnect, and after a CONNECT that went unanswered (through the candidate);
+ * that the snapshot can be read while ocb_run reconnects; and that what the bridge's
+ * save handler has stored rejoins the session at any moment, including while a
+ * reconnect is still waiting for the server's answer.
  *
  * Prints key fingerprints only, never a cookie. */
 #include <Security/Security.h>
@@ -24,6 +27,12 @@ static char *openconnect_strap_candidate_cookie(struct openconnect_info *vpninfo
 {
 	(void)vpninfo;
 	return NULL;
+}
+typedef void (*openconnect_session_changed_vfn)(void *privdata);
+static void openconnect_set_session_changed_handler(struct openconnect_info *vpninfo,
+						    openconnect_session_changed_vfn handler)
+{
+	(void)vpninfo; (void)handler;
 }
 #endif
 #include "ocbridge.c"
@@ -43,15 +52,33 @@ static int failures;
 
 /* The server. */
 
-enum { ACCEPT, DROP_AFTER_200, LOSE_REPLY, LOSE_REQUEST };
+/* What a CONNECT gets. LOSE_REPLY: the server takes the key, and the connection drops
+ * before its answer. LOSE_REQUEST: it drops before the server sees the request. HOLD: the
+ * server takes the key and then says nothing, the connection left open. HOLD_AFTER_200:
+ * it answers 200 and stops mid-headers, likewise. DECLINE: it answers 503 and keeps the
+ * key it had. DECLINE_TAKEN: it takes the key, then answers 503. */
+enum { ACCEPT, DROP_AFTER_200, LOSE_REPLY, LOSE_REQUEST, HOLD, HOLD_AFTER_200, DECLINE, DECLINE_TAKEN };
 static pthread_mutex_t server_lock = PTHREAD_MUTEX_INITIALIZER;
 static EVP_PKEY *held;              /* the STRAP public key the server holds for the session */
 static char held_fp[17] = "none";
 static int next_action = ACCEPT;    /* what the next `next_count` CONNECTs get; then back to ACCEPT */
 static int next_count;
 static int connects, refused;
+static int holding;                 /* connections the server has gone quiet on, ever */
+static _Atomic int hold_generation; /* bumped to let them go */
 static SSL_CTX *server_ctx;
 static int port;
+
+/* The Keychain, as the provider keeps it: the session saved when ocb_connect returns,
+ * and from then on by the bridge's save handler, on OpenConnect's thread. And as it
+ * was before that handler: saved again only once a reconnect had completed. */
+struct saved { char *url, *cookie, *dnsname, *ip, *candidate; };
+static pthread_mutex_t keep_lock = PTHREAD_MUTEX_INITIALIZER;
+static struct saved kept, kept_after_reconnect;
+static int saves;
+static int in_run;                  /* ocb_run is on: the server checks what it's handed */
+static int new_keys, unsaved_keys;  /* new keys the server took in a run; those not saved first */
+static void cookie_key(const char *cookie, char out[17]);
 
 static void fingerprint(const unsigned char *der, int len, char out[17])
 {
@@ -123,6 +150,19 @@ static const char CONNECT_OK[] =
 	"X-CSTP-Netmask: 255.255.255.0\r\nX-CSTP-MTU: 1300\r\nX-CSTP-DPD: 300\r\n"
 	"X-CSTP-Keepalive: 300\r\n\r\n";
 static const char REFUSED[] = "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n";
+static const char UNAVAILABLE[] =
+	"HTTP/1.1 503 Service Unavailable\r\nX-Reason: testing\r\nContent-Length: 0\r\n\r\n";
+static const char CONNECT_OK_UNFINISHED[] = "HTTP/1.1 200 OK\r\nX-CSTP-Version: 1\r\n";
+
+/* Says nothing more on this connection, and leaves it open, until let go. */
+static void go_quiet(void)
+{
+	int generation = hold_generation;
+	pthread_mutex_lock(&server_lock);
+	holding++;
+	pthread_mutex_unlock(&server_lock);
+	while (hold_generation == generation) usleep(10000);
+}
 
 /* One request's head (and body, read and dropped), or NULL when the client is gone. */
 static char *read_request(SSL *ssl)
@@ -171,11 +211,34 @@ static void *serve(void *arg)
 			int ok = pub && sig && cookie && !strcmp(cookie, "webvpn=FAKESESSION") &&
 				 strap_verifies(ssl, pub, publen, sig);
 			if (!ok) refused++;
-			if (ok && action != LOSE_REQUEST) hold(pub, publen);
+			if (ok && action != LOSE_REQUEST && action != DECLINE) {
+				char was[17], now[17];
+				strcpy(was, held_fp);
+				hold(pub, publen);
+				strcpy(now, held_fp);
+				/* A key the server didn't hold before: in a run, the client must
+				 * have saved it already, before it sent this request. */
+				pthread_mutex_lock(&keep_lock);
+				if (in_run && strcmp(was, now)) {
+					char saved_key[17], saved_candidate[17];
+					cookie_key(kept.cookie, saved_key);
+					cookie_key(kept.candidate, saved_candidate);
+					new_keys++;
+					if (strcmp(now, saved_key) && strcmp(now, saved_candidate)) unsaved_keys++;
+				}
+				pthread_mutex_unlock(&keep_lock);
+			}
 			pthread_mutex_unlock(&server_lock);
 			free(sig); free(cookie); free(pub); free(pub_b64); free(req);
 			if (action == LOSE_REQUEST || (ok && action == LOSE_REPLY)) goto out; /* no answer */
 			if (!ok) { SSL_write(ssl, REFUSED, sizeof REFUSED - 1); goto out; }
+			if (action == DECLINE || action == DECLINE_TAKEN) { SSL_write(ssl, UNAVAILABLE, sizeof UNAVAILABLE - 1); goto out; }
+			if (action == HOLD) { go_quiet(); goto out; }
+			if (action == HOLD_AFTER_200) {
+				SSL_write(ssl, CONNECT_OK_UNFINISHED, sizeof CONNECT_OK_UNFINISHED - 1);
+				go_quiet();
+				goto out;
+			}
 			SSL_write(ssl, CONNECT_OK, sizeof CONNECT_OK - 1);
 			if (action == DROP_AFTER_200) { usleep(300000); goto out; }
 			char sink[4096];
@@ -264,8 +327,6 @@ static int server_count(const int *counter)
 /* The client: the bridge, called as PacketTunnelProvider calls it. */
 
 /* What the provider saves. */
-struct saved { char *url, *cookie, *dnsname, *ip, *candidate; };
-
 static int take_saved(ocb_session *s, struct saved *out)
 {
 	ocb_saved now;
@@ -280,6 +341,41 @@ static void drop_saved(struct saved *v)
 {
 	free(v->url); free(v->cookie); free(v->dnsname); free(v->ip); free(v->candidate);
 	memset(v, 0, sizeof *v);
+}
+
+static char *copy(const char *v) { return v ? strdup(v) : NULL; }
+
+/* Saves the session as it stands: as the provider's saveSession. `completed`: a login
+ * or a whole reconnect is behind it, which is the only time it used to be saved. */
+static void keep(ocb_session *s, int completed)
+{
+	struct saved now, too;
+	if (take_saved(s, &now)) return;
+	too = (struct saved){ copy(now.url), copy(now.cookie), copy(now.dnsname), copy(now.ip), copy(now.candidate) };
+	pthread_mutex_lock(&keep_lock);
+	drop_saved(&kept);
+	kept = now;
+	saves++;
+	if (completed) { drop_saved(&kept_after_reconnect); kept_after_reconnect = too; }
+	pthread_mutex_unlock(&keep_lock);
+	if (!completed) drop_saved(&too);
+}
+
+/* Reads it back, as the next start of the extension would: all a new process has. */
+static void read_kept(struct saved *now, struct saved *as_before)
+{
+	pthread_mutex_lock(&keep_lock);
+	*now = (struct saved){ copy(kept.url), copy(kept.cookie), copy(kept.dnsname), copy(kept.ip), copy(kept.candidate) };
+	*as_before = (struct saved){ copy(kept_after_reconnect.url), copy(kept_after_reconnect.cookie),
+		copy(kept_after_reconnect.dnsname), copy(kept_after_reconnect.ip), copy(kept_after_reconnect.candidate) };
+	pthread_mutex_unlock(&keep_lock);
+}
+
+/* The bridge's save handler: on OpenConnect's thread, which waits for it. */
+static void on_save(void *ctx, ocb_session *s)
+{
+	(void)ctx;
+	keep(s, 0);
 }
 
 /* The fingerprint of the public half of the STRAP key a cookie carries, as the server's. */
@@ -321,6 +417,10 @@ static void on_event(void *ctx, int event, const ocb_config *cfg)
 {
 	(void)ctx; (void)cfg;
 	pthread_mutex_lock(&event_lock);
+	ocb_session *s = running;
+	pthread_mutex_unlock(&event_lock);
+	if (event == OCB_RECONNECTED && s) keep(s, 1); /* as the provider's reconnected(_:) */
+	pthread_mutex_lock(&event_lock);
 	if (event == OCB_RECONNECTED) reconnects++;
 	if (event == OCB_RECONNECTING) {
 		sleeps++;
@@ -359,6 +459,7 @@ static ocb_session *new_session(void)
 {
 	ocb_session *s = ocb_new(url, "netid", "password", "push", on_log, on_event, NULL);
 	if (!s) { fprintf(stderr, "ocb_new failed\n"); exit(2); }
+	ocb_set_save_handler(s, on_save);
 	return s;
 }
 
@@ -368,6 +469,7 @@ static ocb_session *login(struct saved *after)
 	ocb_session *s = new_session();
 	if (ocb_connect(s, err, sizeof err)) { fprintf(stderr, "login failed: %s\n", err); exit(2); }
 	if (take_saved(s, after)) { fprintf(stderr, "nothing to save after login\n"); exit(2); }
+	keep(s, 1);
 	return s;
 }
 
@@ -383,11 +485,15 @@ static int resume(const struct saved *v, const char *cookie, ocb_session **out)
 	return result;
 }
 
-static int run_result;
+static int run_result, run_over;
 static int tun[2];
 static void *run_thread(void *arg)
 {
-	run_result = ocb_run(arg, tun[0], 60);
+	int result = ocb_run(arg, tun[0], 60);
+	pthread_mutex_lock(&event_lock);
+	run_result = result;
+	run_over = 1;
+	pthread_mutex_unlock(&event_lock);
 	return NULL;
 }
 
@@ -396,7 +502,11 @@ static pthread_t start_run(ocb_session *s)
 	pthread_t t;
 	pthread_mutex_lock(&event_lock);
 	running = s;
+	run_over = 0;
 	pthread_mutex_unlock(&event_lock);
+	pthread_mutex_lock(&keep_lock);
+	in_run = 1;
+	pthread_mutex_unlock(&keep_lock);
 	if (socketpair(AF_UNIX, SOCK_DGRAM, 0, tun)) { perror("socketpair"); exit(2); }
 	pthread_create(&t, NULL, run_thread, s);
 	return t;
@@ -405,7 +515,20 @@ static pthread_t start_run(ocb_session *s)
 static void end_run(pthread_t t)
 {
 	pthread_join(t, NULL);
+	pthread_mutex_lock(&keep_lock);
+	in_run = 0;
+	pthread_mutex_unlock(&keep_lock);
+	pthread_mutex_lock(&event_lock);
+	running = NULL;
+	pthread_mutex_unlock(&event_lock);
 	close(tun[0]); close(tun[1]);
+}
+
+/* Waits (up to 20 s) for the server to go quiet on one more connection than `seen`. */
+static int wait_quiet(int seen)
+{
+	for (int i = 0; i < 2000 && server_count(&holding) <= seen; i++) usleep(10000);
+	return server_count(&holding) > seen;
 }
 
 /* Reads the snapshot as fast as it can while the run thread reconnects, as the
@@ -592,13 +715,113 @@ int main(int argc, char **argv)
 	server_next(LOSE_REQUEST, 1);
 	ocb_reconnect(s);
 	end_run(run); /* ends on its own */
-	CHECK(run_result == -EPERM && server_count(&refused) == before + 1, "the run ended on the server's 401");
+	CHECK(event_count(&run_result) == -EPERM && server_count(&refused) == before + 1, "the run ended on the server's 401");
 	take_saved(s, &v);
 	ocb_free(s);
 	server_key(server); cookie_key(v.cookie, key);
 	CHECK(v.candidate != NULL && !strcmp(server, key), "the snapshot keeps the server's key in the cookie, and a candidate");
 	CHECK(resume(&v, v.cookie, NULL) == 0, "a rejoin with the cookie is accepted: the session goes on");
 	drop_saved(&v); drop_saved(&after_login);
+
+	/* G. iOS can end the extension at any moment, such as right here: a reconnect's
+	 * CONNECT reached the server, which took the new key, and no answer has come.
+	 * OpenConnect is still waiting, so no reconnect has completed and the run hasn't
+	 * ended. All a new process has is what was saved by then. */
+	struct saved now, as_before;
+	printf("G. a reconnect's CONNECT is taken and not answered; the extension dies while it waits\n");
+	s = login(&after_login);
+	run = start_run(s);
+	int quiet = server_count(&holding);
+	server_next(HOLD, 1);
+	ocb_reconnect(s);
+	CHECK(wait_quiet(quiet), "the server took the new key and has gone quiet");
+	read_kept(&now, &as_before);
+	CHECK(!event_count(&run_over), "the run is still waiting for the answer");
+	server_key(server); cookie_key(now.candidate, key);
+	CHECK(now.candidate && !strcmp(server, key), "what's saved by now has the server's key, as the candidate");
+	CHECK(!as_before.candidate && resume(&as_before, as_before.cookie, NULL) == OCB_SESSION_ENDED,
+	      "(saved only after a completed reconnect, as before, it has no candidate and its cookie is refused)");
+	CHECK(resume(&now, now.cookie, NULL) == OCB_SESSION_ENDED, "a rejoin with the saved cookie is refused");
+	CHECK(now.candidate && resume(&now, now.candidate, NULL) == 0,
+	      "a rejoin with the saved candidate is accepted, with the first run still waiting");
+	CHECK(!event_count(&run_over), "(it still is)");
+	drop_saved(&now); drop_saved(&as_before);
+	ocb_detach(s);
+	end_run(run);
+	hold_generation++;
+	ocb_free(s);
+	drop_saved(&after_login);
+
+	/* H. The same moment a little later: the server's 200 has arrived and the rest of
+	 * its answer hasn't, so the reconnect isn't complete, and may yet fail. */
+	printf("H. a reconnect gets its 200 and nothing after; the extension dies while it waits\n");
+	s = login(&after_login);
+	run = start_run(s);
+	quiet = server_count(&holding);
+	seen = event_count(&reconnects);
+	server_next(HOLD_AFTER_200, 1);
+	ocb_reconnect(s);
+	CHECK(wait_quiet(quiet), "the server answered 200 and has gone quiet");
+	/* The 200 is on its way to the client; the save follows it. */
+	for (int i = 0; i < 2000; i++) {
+		read_kept(&now, &as_before);
+		server_key(server); cookie_key(now.cookie, key);
+		if (!strcmp(server, key)) break;
+		drop_saved(&now); drop_saved(&as_before);
+		usleep(10000);
+	}
+	CHECK(!event_count(&run_over) && event_count(&reconnects) == seen, "the reconnect hasn't completed, nor the run ended");
+	CHECK(now.cookie && !strcmp(server, key) && !now.candidate, "what's saved by now has the server's key in the cookie");
+	CHECK(as_before.cookie && resume(&as_before, as_before.cookie, NULL) == OCB_SESSION_ENDED,
+	      "(saved only after a completed reconnect, as before, its cookie is refused)");
+	CHECK(now.cookie && resume(&now, now.cookie, NULL) == 0, "a rejoin with the saved cookie is accepted");
+	drop_saved(&now); drop_saved(&as_before);
+	ocb_detach(s);
+	end_run(run);
+	hold_generation++;
+	ocb_free(s);
+	drop_saved(&after_login);
+
+	/* I. The server answers a reconnect's CONNECT with an error. It most likely didn't
+	 * take the new key, so the next attempt has to be signed by the one it still holds. */
+	printf("I. the server answers a reconnect 503, keeping its key; the next attempt, on request\n");
+	s = login(&after_login);
+	run = start_run(s);
+	seen = event_count(&reconnects); slept = event_count(&sleeps);
+	refused_before = server_count(&refused);
+	server_next(DECLINE, 1);
+	pthread_mutex_lock(&event_lock); on_sleep = 2; pthread_mutex_unlock(&event_lock);
+	ocb_reconnect(s);
+	CHECK(wait_past(&sleeps, slept), "the attempt failed");
+	CHECK(wait_past(&reconnects, seen), "the next attempt reconnected");
+	take_saved(s, &v);
+	server_key(server); cookie_key(v.cookie, key);
+	CHECK(!strcmp(server, key) && !v.candidate && server_count(&refused) == refused_before,
+	      "the snapshot carries the key the server took, no candidate, nothing refused");
+	drop_saved(&v);
+
+	/* J. Or it did take the key before answering 503 (nobody outside Cisco knows which).
+	 * Then that next attempt is refused and ends the run, and the candidate rejoins. */
+	printf("J. the server takes a reconnect's key, then answers 503; the next attempt ends the run\n");
+	before = server_count(&refused);
+	server_next(DECLINE_TAKEN, 1);
+	pthread_mutex_lock(&event_lock); on_sleep = 2; pthread_mutex_unlock(&event_lock);
+	ocb_reconnect(s);
+	end_run(run); /* ends on its own */
+	CHECK(event_count(&run_result) == -EPERM && server_count(&refused) == before + 1, "the run ended on the server's 401");
+	read_kept(&now, &as_before);
+	ocb_free(s);
+	server_key(server); cookie_key(now.candidate, key);
+	CHECK(now.candidate && !strcmp(server, key), "what's saved has the server's key, as the candidate");
+	CHECK(resume(&now, now.cookie, NULL) == OCB_SESSION_ENDED, "a rejoin with the cookie is refused");
+	CHECK(now.candidate && resume(&now, now.candidate, NULL) == 0, "a rejoin with the candidate is accepted");
+	drop_saved(&now); drop_saved(&as_before); drop_saved(&after_login);
+
+	pthread_mutex_lock(&keep_lock);
+	int taken = new_keys, unsaved = unsaved_keys, saved_times = saves;
+	pthread_mutex_unlock(&keep_lock);
+	printf("     %d new keys taken by the server during runs; the session saved %d times\n", taken, saved_times);
+	CHECK(taken > 0 && unsaved == 0, "every new key a reconnect handed the server was saved before its request went out");
 
 	pthread_mutex_lock(&log_lock);
 	int lines = log_lines, leaks = leaked;

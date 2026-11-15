@@ -33,18 +33,27 @@ struct ocb_session {
     char first_error[256]; // OpenConnect's first error in ocb_connect, to say why it failed
     char *connect_url;
     char *pin_name, *pin_ip; // resolve pin_name to pin_ip (see ocb_resume)
+    // The server's name and the address the session was made on, which a rejoin pins.
+    // Settled once, by ocb_connect or ocb_resume: a reconnect may be to another address,
+    // and on an IPv6-only network to one that only works there (NAT64).
+    char *made_name, *made_ip;
     char limits_logged[6][64]; // the session limits last logged, in log_server_limits' order
     // What ocb_resume needs to rejoin the session, copied on the thread that's running
     // OpenConnect: a reconnect replaces the cookie there (openconnect-strap-cookie.patch)
     // while ocb_session_saved reads on another.
     pthread_mutex_t saved_lock;
     ocb_saved saved;
+    ocb_save_fn save;
+    bool running; // in ocb_run's mainloop; only touched on its thread
 };
 
 enum { LOGIN_IDLE, LOGIN_SENDING_SECRETS, LOGIN_ABORTED };
 
 static void reconnected_cb(void *priv);
+static void session_changed_cb(void *priv);
 static void snapshot_saved(ocb_session *s);
+static void settle_address(ocb_session *s);
+static char *dup_or_null(const char *v);
 static void wipe_free(char *p);
 
 static void logf_(struct ocb_session *s, int level, const char *fmt, ...) {
@@ -233,6 +242,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
     openconnect_set_loglevel(s->vpn, PRG_INFO);
     openconnect_set_reported_os(s->vpn, "apple-ios");
     openconnect_set_reconnected_handler(s->vpn, reconnected_cb);
+    openconnect_set_session_changed_handler(s->vpn, session_changed_cb);
     s->cmd_fd = openconnect_setup_cmd_pipe(s->vpn);
     if (s->cmd_fd < 0) { ocb_free(s); return NULL; }
     return s;
@@ -269,6 +279,7 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen) {
         snprintf(err, errlen, "Logged in, but couldn't open the VPN session.");
         return -1;
     }
+    settle_address(s);
     snapshot_saved(s); // not the cookie from the login: that CONNECT gave the server a new key
     log_server_limits(s);
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
@@ -311,6 +322,9 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
         snprintf(err, errlen, "Invalid saved session.");
         return OCB_SESSION_ENDED;
     }
+    // Saved again as they came: this connection may be to another of the server's addresses.
+    s->made_name = dup_or_null(dnsname);
+    s->made_ip = dup_or_null(ip);
     if (dnsname && *dnsname && ip && *ip) {
         size_t n = strlen(ip);
         bool bracketed = n > 2 && ip[0] == '[' && ip[n - 1] == ']'; // IPv6 as in a URL
@@ -326,6 +340,7 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
                                              : "Couldn't reach the VPN server.");
         return ret == -EPERM ? OCB_SESSION_ENDED : -1;
     }
+    settle_address(s); // what a session saved without them lacks
     snapshot_saved(s);
     log_server_limits(s);
     // As openconnect's own client does: otherwise every reconnect retries DTLS.
@@ -338,8 +353,17 @@ int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *
 
 static char *dup_or_null(const char *v) { return v && *v ? strdup(v) : NULL; }
 
+// The session is up on this connection: unless ocb_resume was given them, its name and
+// address are the ones to rejoin it on.
+static void settle_address(ocb_session *s) {
+    if (!s->made_name) s->made_name = dup_or_null(openconnect_get_dnsname(s->vpn));
+    // The address connected to, despite the name.
+    if (!s->made_ip) s->made_ip = dup_or_null(openconnect_get_hostname(s->vpn));
+}
+
 // Copies what ocb_resume needs out of OpenConnect. Only on the thread that's running
-// it: after ocb_connect or ocb_resume, in reconnected_cb, and when ocb_run ends.
+// it: after ocb_connect or ocb_resume, whenever OpenConnect says the session's keys
+// changed (session_changed_cb), in reconnected_cb, and when ocb_run ends.
 static void snapshot_saved(ocb_session *s) {
     // openconnect_get_connect_url appends to its buffer on every call; ask once.
     if (!s->connect_url) s->connect_url = dup_or_null(openconnect_get_connect_url(s->vpn));
@@ -350,8 +374,9 @@ static void snapshot_saved(ocb_session *s) {
     ocb_saved next = {
         .url = dup_or_null(s->connect_url),
         .cookie = dup_or_null(cookie),
-        .dnsname = dup_or_null(openconnect_get_dnsname(s->vpn)),
-        .ip = dup_or_null(openconnect_get_hostname(s->vpn)), // the address connected to, despite the name
+        // Until they're settled (a login's first CONNECT), where OpenConnect is now.
+        .dnsname = dup_or_null(s->made_name ? s->made_name : openconnect_get_dnsname(s->vpn)),
+        .ip = dup_or_null(s->made_ip ? s->made_ip : openconnect_get_hostname(s->vpn)),
         .candidate = candidate,
     };
     pthread_mutex_lock(&s->saved_lock);
@@ -360,6 +385,19 @@ static void snapshot_saved(ocb_session *s) {
     pthread_mutex_unlock(&s->saved_lock);
     ocb_saved_free(&old);
 }
+
+// On the thread that's running OpenConnect: a CONNECT is about to present a new key (the
+// request waits for this to return), or has got its 200 and the cookie carries the key
+// the server took (openconnect-strap-cookie.patch).
+static void session_changed_cb(void *priv) {
+    struct ocb_session *s = priv;
+    snapshot_saved(s);
+    // Only with the tunnel up. ocb_connect and ocb_resume leave saving to their caller,
+    // once they've returned: a login whose session didn't open isn't one to rejoin.
+    if (s->running && s->save) s->save(s->ctx, s);
+}
+
+void ocb_set_save_handler(ocb_session *s, ocb_save_fn save) { s->save = save; }
 
 int ocb_session_saved(ocb_session *s, ocb_saved *out) {
     memset(out, 0, sizeof *out);
@@ -458,11 +496,14 @@ void ocb_config_free(ocb_config *c) {
 int ocb_run(ocb_session *s, int tun_fd, int reconnect_timeout) {
     if (openconnect_setup_tun_fd(s->vpn, tun_fd)) return -1;
     int ret;
+    s->running = true; // from here on, session_changed_cb has the session saved
     // Only a pause makes the mainloop return 0 (it closes its connections first).
     // Calling it again reconnects with the session cookie: no new login or Duo push.
     while ((ret = openconnect_mainloop(s->vpn, reconnect_timeout, RECONNECT_INTERVAL_MIN)) == 0) {}
+    s->running = false;
     // Its last reconnect may have got the server's 200 (so the server holds a new key)
     // and then failed, or sent a new key and heard nothing back: keep both to save.
+    // (Already saved as each happened; this is what the caller reads once more.)
     snapshot_saved(s);
     return ret;
 }
@@ -511,6 +552,8 @@ void ocb_free(ocb_session *s) {
     free(s->connect_url);
     free(s->pin_name);
     free(s->pin_ip);
+    free(s->made_name);
+    free(s->made_ip);
     ocb_saved_free(&s->saved);
     pthread_mutex_destroy(&s->saved_lock);
     free(s);
