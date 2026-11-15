@@ -52,11 +52,6 @@ final class VPNController: ObservableObject {
 
     var isConnected: Bool { status == .connected }
     var isBusy: Bool { [.connecting, .disconnecting, .reasserting].contains(status) }
-    /// Connecting is iOS's automatic attempt rejoining the saved session (Stay Connected),
-    /// which asks for no Duo. Our own logins run with on-demand off (see mayStartLogin).
-    var isRejoining: Bool {
-        status == .connecting && manager?.isOnDemandEnabled == true && SavedSessionItem.exists
-    }
 
     func load() async {
         guard manager == nil else { return }
