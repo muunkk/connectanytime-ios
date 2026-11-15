@@ -128,6 +128,16 @@ xcodebuild test -project ConnectAnytime.xcodeproj -scheme ConnectAnytimeTests \
 The unit tests cover logic that needs no VPN or Keychain, and run on the Simulator
 without the app or the libraries above.
 
+```sh
+scripts/test-strap-cookie.sh
+```
+
+This one runs on the Mac, after `Vendor/build-deps.sh` (it uses the OpenConnect
+download) and with Homebrew's `openssl@3`. It builds the patched OpenConnect for the Mac
+and runs `Vendor/tests/strap-cookie-test.c`, which tests the patch above: which key the
+session cookie carries after each kind of reconnect. It then has to fail against
+OpenConnect without the patch.
+
 A VPN can't run in the Simulator, but the whole app builds for it once the libraries
 exist for it too (Apple silicon Macs only):
 
