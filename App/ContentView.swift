@@ -26,7 +26,13 @@ struct ContentView: View {
                             .font(.headline)
                         Button {
                             focused = nil
-                            Task { if vpn.isConnected || vpn.isBusy { await vpn.disconnect() } else { await vpn.connect() } }
+                            if vpn.isConnected || vpn.isBusy {
+                                Task { await vpn.disconnect() }
+                            } else {
+                                // Typed but not saved yet: save it, and don't log in with the old one.
+                                if !password.isEmpty, !savePassword() { return }
+                                Task { await vpn.connect() }
+                            }
                         } label: {
                             Text(vpn.isConnected || vpn.isBusy ? "Disconnect" : "Connect")
                                 .frame(maxWidth: .infinity)
@@ -52,13 +58,15 @@ struct ContentView: View {
                         .textInputAutocapitalization(.never)
                         .autocorrectionDisabled()
                         .focused($focused, equals: .netID)
+                        .submitLabel(.next)
+                        .onSubmit { focused = .password }
                     HStack {
                         SecureField(vpn.hasPassword ? "Password saved" : "Password", text: $password)
                             .textContentType(.password)
                             .focused($focused, equals: .password)
                             .submitLabel(.done)
-                            .onSubmit(savePassword) // Return saves; otherwise the next Connect uses the old one
-                        Button("Save", action: savePassword)
+                            .onSubmit { savePassword() } // Return saves
+                        Button("Save") { savePassword() }
                             .disabled(password.isEmpty)
                     }
                 } header: {
@@ -129,15 +137,17 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, phase in
             if phase == .active { vpn.refresh() } // e.g. back from approving in Duo
         }
-        .onChange(of: vpn.lastError) { _, error in
-            if let error { AccessibilityNotification.Announcement(error).post() } // so VoiceOver reads it out
+        .onChange(of: vpn.errors) { // so VoiceOver reads it out, even when it's the same again
+            if let error = vpn.lastError { AccessibilityNotification.Announcement(error).post() }
         }
     }
 
-    private func savePassword() {
-        vpn.savePassword(password)
+    @discardableResult
+    private func savePassword() -> Bool {
+        let saved = vpn.savePassword(password)
         password = ""
         focused = nil
+        return saved
     }
 
     private func addNetwork() {
