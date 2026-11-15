@@ -374,6 +374,26 @@ static void test_handler_and_signing(void)
 		CHECK(saved && !strcmp(saved, fourth), "until a 200 puts it in the cookie");
 		free(saved);
 	}
+
+#ifdef HAVE_DTLS
+	/* A rekey that returns early, after its new key is made, through a way out that
+	 * doesn't know about STRAP: DTLS with no master secret. Until its request is
+	 * written a key counts as not taken, so the next CONNECT resends it, saved first. */
+	vpninfo->dtls_state = DTLS_SECRET;
+	memset(vpninfo->dtls_secret, 0, sizeof(vpninfo->dtls_secret));
+	connect_via(vpninfo, NULL, 0);
+	CHECK(start_cstp_connection(vpninfo, 1) == -EINVAL && !sent[0] && changes == 11,
+	      "a rekey that stops early (no DTLS secret) sends nothing");
+	vpninfo->dtls_state = DTLS_DISABLED;
+	connect_via(vpninfo, NULL, 0);
+	start_cstp_connection(vpninfo, 1);
+	presented = sent_pubkey();
+	CHECK(changes == 12 && !seen[11].request_sent && presented && seen[11].candidate_key &&
+	      !strcmp(seen[11].candidate_key, presented) && strcmp(presented, fourth) &&
+	      signed_by(fourth) && !signed_by(presented),
+	      "the next CONNECT resends its key, saved first and signed by the accepted one");
+	free(presented);
+#endif
 	free(third); free(fourth);
 }
 #endif
