@@ -8,9 +8,11 @@
  * signs a CONNECT that presents an unresolved key again. */
 #include <config.h>
 #include "openconnect-internal.h"
-/* Building the request fails (out of memory, a failed signature) when set. */
-static int fail_build;
-#define buf_error(b) (fail_build ? -ENOMEM : buf_error(b))
+/* A buffer fails as when out of memory: the fail_buf-th call of buf_error() in cstp.c
+ * from when it's set (1 is the request a CONNECT builds), then none. */
+static int fail_buf, buf_checks;
+#define buf_error(b) (fail_buf && ++buf_checks == fail_buf ? \
+	(fail_buf = buf_checks = 0, (b)->error = -ENOMEM) : buf_error(b))
 #include "cstp.c" /* start_cstp_connection and strap_cookie are static */
 
 #include <openssl/evp.h>
@@ -229,7 +231,7 @@ static void test_handler_and_signing(void)
 	static const char *const unavailable[] = { "HTTP/1.1 503 Service Unavailable", "X-Reason: testing", "" };
 	static const char *const unauthorized[] = { "HTTP/1.1 401 Unauthorized", "" };
 	struct openconnect_info *vpninfo = logged_in();
-	char *login_key = strdup(vpninfo->strap_pubkey), *presented, *first, *second;
+	char *login_key = strdup(vpninfo->strap_pubkey), *presented, *first, *second, *third, *fourth;
 
 	/* 7. A client saves the session from the handler. It has to run before a new key
 	 *    goes out, with that key as the candidate, and again at the 200. */
@@ -327,23 +329,52 @@ static void test_handler_and_signing(void)
 	presented = sent_pubkey();
 	CHECK(presented && strcmp(presented, second) && signed_by(second),
 	      "and the next CONNECT rekeys, signed by it");
-	free(presented);
+	third = presented;
 
 	/* A rekey whose request can't be built: the new key is made but nothing goes out.
 	 * The next CONNECT sends that key, so it has to be saved first then. */
 	CHECK(changes == 8, "that rekey ran the handler before it and at its 200");
 	connect_via(vpninfo, NULL, 0);
-	fail_build = 1;
+	fail_buf = 1;
+	CHECK(start_cstp_connection(vpninfo, 1) == -ENOMEM && !sent[0] && changes == 8,
+	      "a rekey whose request can't be built sends nothing");
+	connect_via(vpninfo, NULL, 0);
 	start_cstp_connection(vpninfo, 1);
-	fail_build = 0;
-	CHECK(!sent[0] && changes == 8, "a rekey whose request can't be built sends nothing");
+	fourth = sent_pubkey();
+	CHECK(changes == 9 && !seen[8].request_sent && fourth && seen[8].candidate_key &&
+	      !strcmp(seen[8].candidate_key, fourth) && strcmp(fourth, third),
+	      "the next CONNECT presents that key, and the handler saves it before it goes out");
+	CHECK(signed_by(third) && !signed_by(fourth), "signed by the accepted key");
+
+	/* Its 200 comes, but the new key can't be put in the cookie. The cookie keeps the
+	 * old key, so the new one stays the candidate and is presented again, never
+	 * replaced by a newer one the server may never get. */
+	connect_via(vpninfo, ok_then_truncated, 1);
+	fail_buf = 2; /* past the request's, to the one putting the key in the cookie */
+	start_cstp_connection(vpninfo, 1);
+	CHECK(sent[0], "(that CONNECT was sent)");
+	{
+		char *saved = resume_pubkey(vpninfo->cookie, NULL);
+		char *cand = openconnect_strap_candidate_cookie(vpninfo);
+		char *next = cand ? resume_pubkey(cand, NULL) : NULL;
+		CHECK(!fail_buf && saved && !strcmp(saved, third) && next && !strcmp(next, fourth),
+		      "a 200 whose key can't be put in the cookie leaves {accepted, that key}");
+		free(saved); free(cand); free(next);
+	}
 	connect_via(vpninfo, NULL, 0);
 	start_cstp_connection(vpninfo, 1);
 	presented = sent_pubkey();
-	CHECK(changes == 9 && !seen[8].request_sent && presented && seen[8].candidate_key &&
-	      !strcmp(seen[8].candidate_key, presented) && strcmp(presented, second),
-	      "the next CONNECT presents that key, and the handler saves it before it goes out");
+	CHECK(presented && !strcmp(presented, fourth) && signed_by(fourth),
+	      "and the next CONNECT presents it again rather than a newer key");
 	free(presented);
+	connect_via(vpninfo, ok_then_truncated, 1);
+	start_cstp_connection(vpninfo, 1);
+	{
+		char *saved = resume_pubkey(vpninfo->cookie, NULL);
+		CHECK(saved && !strcmp(saved, fourth), "until a 200 puts it in the cookie");
+		free(saved);
+	}
+	free(third); free(fourth);
 }
 #endif
 

@@ -67,6 +67,10 @@ which fits the 401s above. The other is that refusing a key with 401 leaves the 
 itself open, so the other saved key can still rejoin it. If a refusal ended the session
 instead, a reconnect cut off between its two saves could still cost a new login.
 
+If saving to the Keychain fails, the extension logs it and reconnects anyway: holding
+the VPN down until the Keychain works would cost more than the new login this risks, and
+only if iOS also ends the extension before the next save succeeds.
+
 ## Your password
 
 - Stored in the iPhone Keychain, shared only between the app and its VPN extension.

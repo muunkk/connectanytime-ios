@@ -1,8 +1,8 @@
 diff --git a/cstp.c b/cstp.c
-index b071174..896e7b1 100644
+index b071174..e5379ce 100644
 --- a/cstp.c
 +++ b/cstp.c
-@@ -223,6 +223,96 @@ static void append_connect_strap_headers(struct openconnect_info *vpninfo,
+@@ -223,6 +223,106 @@ static void append_connect_strap_headers(struct openconnect_info *vpninfo,
  }
  #endif
  
@@ -46,17 +46,20 @@ index b071174..896e7b1 100644
 +#endif
 +}
 +
-+/* The server accepted the key this CONNECT presented: put it in the cookie. */
-+static void refresh_strap_cookie(struct openconnect_info *vpninfo)
++/* The server accepted the key this CONNECT presented: put it in the cookie. Fails
++ * (-ENOMEM) only if there is a key to put there and it couldn't be. */
++static int refresh_strap_cookie(struct openconnect_info *vpninfo)
 +{
 +	char *cookie = strap_cookie(vpninfo);
 +
 +	if (!cookie)
-+		return;
++		return (vpninfo->strap_key && vpninfo->cookie &&
++			!strncmp(vpninfo->cookie, "openconnect_strapkey=", 21)) ? -ENOMEM : 0;
 +	memset(vpninfo->cookie, 0, strlen(vpninfo->cookie));
 +	free(vpninfo->cookie);
 +	vpninfo->cookie = cookie;
 +	vpn_progress(vpninfo, PRG_DEBUG, _("Refreshed STRAP key in session cookie\n"));
++	return 0;
 +}
 +
 +/* The cookie with the key OpenConnect would present next. It differs from
@@ -96,10 +99,17 @@ index b071174..896e7b1 100644
 +#endif
 +}
 +
++/* A CONNECT's new or unresolved key, until its request is written. */
++#ifdef OPENCONNECT_OPENSSL
++#define STRAP_PENDING STRAP_NOT_TAKEN
++#else
++#define STRAP_PENDING STRAP_UNANSWERED
++#endif
++
  static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rekey)
  {
  	struct oc_text_buf *reqbuf;
-@@ -234,8 +324,10 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
+@@ -234,8 +334,10 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
  	const char *old_addr6 = vpninfo->ip_info.addr6;
  	const char *banner = NULL;
  	int base_mtu = 0, mtu = 0;
@@ -110,7 +120,7 @@ index b071174..896e7b1 100644
  	calculate_dtls_mtu(vpninfo, &base_mtu, &mtu);
  	vpninfo->cstp_basemtu = base_mtu;
  
-@@ -255,8 +347,27 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
+@@ -255,8 +357,29 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
  		2004, "Cisco Systems, Inc.");
  
  #ifdef HAVE_HPKE_SUPPORT
@@ -133,14 +143,16 @@ index b071174..896e7b1 100644
 +		int rekey = strap_rekey && !vpninfo->strap_unresolved;
 +		int resend = vpninfo->strap_unresolved == STRAP_NOT_TAKEN;
 +		append_connect_strap_headers(vpninfo, reqbuf, rekey ? 1 : resend ? 2 : 0);
++		/* Not taken until the request is written (below): then any way out before
++		 * that, now or added later, makes the next CONNECT a resend, saved first. */
 +		if (rekey || vpninfo->strap_unresolved)
-+			vpninfo->strap_unresolved = STRAP_UNANSWERED;
++			vpninfo->strap_unresolved = STRAP_PENDING;
 +		new_strap_key = rekey || resend; /* resend: its first request may never have gone */
 +	}
  #endif
  
  	append_mobile_headers(vpninfo, reqbuf);
-@@ -327,13 +438,19 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
+@@ -327,13 +450,21 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
  	if (buf_error(reqbuf)) {
  		vpn_progress(vpninfo, PRG_ERR,
  			     _("Error creating HTTPS CONNECT request\n"));
@@ -158,10 +170,12 @@ index b071174..896e7b1 100644
 +
 +	if (vpninfo->ssl_write(vpninfo, reqbuf->data, reqbuf->pos) < 0)
 +		strap_not_taken(vpninfo); /* the read below fails too */
++	else if (vpninfo->strap_unresolved)
++		vpninfo->strap_unresolved = STRAP_UNANSWERED;
  	buf_free(reqbuf);
  
  	/* FIXME: Use process_http_response() instead of reimplementing it. It has
-@@ -359,6 +476,8 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
+@@ -359,6 +490,8 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
  	}
  
  	if (strncmp(buf, "HTTP/1.1 200 ", 13)) {
@@ -170,14 +184,17 @@ index b071174..896e7b1 100644
  		if (!strncmp(buf, "HTTP/1.1 503 ", 13)) {
  			/* "Service Unavailable. Why? */
  			const char *reason = "<unknown>";
-@@ -382,6 +501,12 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
+@@ -382,6 +515,15 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
  	}
  
  	vpn_progress(vpninfo, PRG_INFO, _("Got CONNECT response: %s\n"), buf);
 +	/* The server took the STRAP key with its 200, even if the rest of this response
 +	 * fails: record it now. */
-+	vpninfo->strap_unresolved = 0;
-+	refresh_strap_cookie(vpninfo);
++	if (refresh_strap_cookie(vpninfo))
++		vpn_progress(vpninfo, PRG_ERR,
++			     _("Failed to put the new STRAP key in the session cookie\n"));
++	else
++		vpninfo->strap_unresolved = 0; /* else the cookie lacks it: present it again */
 +	if (vpninfo->session_changed)
 +		vpninfo->session_changed(vpninfo->cbdata);
  
@@ -239,7 +256,7 @@ index 136f181..3135a88 100644
  void openconnect_clear_cookie(struct openconnect_info *);
  
 diff --git a/openssl.c b/openssl.c
-index d663b79..23b10cf 100644
+index d663b79..70687ce 100644
 --- a/openssl.c
 +++ b/openssl.c
 @@ -2422,8 +2422,9 @@ void free_strap_keys(struct openconnect_info *vpninfo)
@@ -263,7 +280,22 @@ index d663b79..23b10cf 100644
  }
  
  #include <openssl/kdf.h>
-@@ -2551,9 +2555,16 @@ void append_strap_verify(struct openconnect_info *vpninfo,
+@@ -2527,6 +2531,14 @@ void append_strap_verify(struct openconnect_info *vpninfo,
+ 	unsigned char finished[64];
+ 	size_t flen;
+ 
++	/* A fresh rekey forgets the last one's previous key before any way out of here,
++	 * so a resend after a failure here can't be signed by it (it signs with the
++	 * current key instead). */
++	if (rekey == 1) {
++		EC_KEY_free(vpninfo->strap_prev_key);
++		vpninfo->strap_prev_key = NULL;
++	}
++
+ 	if (SSL_SESSION_get_protocol_version(SSL_get_session(vpninfo->https_ssl)) <= TLS1_2_VERSION) {
+ 		/* For TLSv1.2 and earlier, use RFC5929 'tls-unique' channel binding */
+ 		flen = SSL_get_finished(vpninfo->https_ssl, finished, sizeof(finished));
+@@ -2551,9 +2563,16 @@ void append_strap_verify(struct openconnect_info *vpninfo,
  		flen = TLS_EXPORTER_KEY_SIZE;
  	}
  
@@ -282,7 +314,7 @@ index d663b79..23b10cf 100644
  		vpn_progress(vpninfo, PRG_ERR,
  			     _("STRAP signature failed\n"));
  	fail_errors:
-@@ -2568,12 +2579,18 @@ void append_strap_verify(struct openconnect_info *vpninfo,
+@@ -2568,12 +2587,18 @@ void append_strap_verify(struct openconnect_info *vpninfo,
  	unsigned char *pubkey_der = NULL;
  	int pubkey_derlen = 0;
  	if (rekey) {

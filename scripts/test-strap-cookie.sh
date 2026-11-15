@@ -39,8 +39,9 @@ build() {
       CC=/usr/bin/clang ./configure --enable-static --disable-shared --disable-nls --disable-docs \
         --without-gnutls --with-openssl --without-libpskc --without-stoken --without-libpcsclite \
         --without-libproxy --without-gssapi --without-lz4 --without-java \
-        --with-vpnc-script=/var/empty/vpnc-script >/dev/null 2>&1
-      make -j"$(sysctl -n hw.ncpu)" libopenconnect.la >/dev/null)
+        --with-vpnc-script=/var/empty/vpnc-script >"$work/build.log" 2>&1 &&
+      make -j"$(sysctl -n hw.ncpu)" libopenconnect.la >>"$work/build.log" 2>&1) ||
+      { echo "Building OpenConnect in $work failed:"; tail -20 "$work/build.log"; exit 1; }
     echo "$sum" > "$work/build.sha256"
   fi
   grep -q 'define HAVE_HPKE_SUPPORT 1' "$oc/config.h" || { echo "OpenConnect built without STRAP support"; exit 1; }
