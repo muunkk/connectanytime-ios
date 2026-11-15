@@ -9,7 +9,9 @@ final class VPNController: ObservableObject {
     static let shared = VPNController()
 
     @Published private(set) var status: NEVPNStatus = .invalid
-    @Published private(set) var lastError: String?
+    @Published private(set) var lastError: String? { didSet { if lastError != nil { errors += 1 } } }
+    /// Counts errors, so the same message twice in a row is still announced to VoiceOver.
+    @Published private(set) var errors = 0
     @Published var netID: String { didSet { UserDefaults.standard.set(netID, forKey: "netID") } }
     @Published var server: String { didSet { UserDefaults.standard.set(server, forKey: "server") } }
     @Published private(set) var autoNetworks: [String] {
@@ -85,8 +87,8 @@ final class VPNController: ObservableObject {
         guard ![.connected, .reasserting].contains(status) else { return nil } // nothing to ask for
         // An emptied Server field would be saved as the address, and kept.
         if server.trimmingCharacters(in: .whitespaces).isEmpty { server = AppConfig.defaultServer }
-        guard !netID.trimmingCharacters(in: .whitespaces).isEmpty else { return refuse("Enter your NetID first.") }
-        guard hasPassword else { return refuse("Save your password first.") }
+        guard !netID.trimmingCharacters(in: .whitespaces).isEmpty else { return refuse("Enter your NetID in ConnectAnytime first.") }
+        guard hasPassword else { return refuse("Save your password in ConnectAnytime first.") }
         ConnectIntent.set(disconnected: false)
         var started: NEVPNConnection?
         var refusal: String?
@@ -103,7 +105,7 @@ final class VPNController: ObservableObject {
                 case .connected, .reasserting: return
                 case .disconnected, .invalid: break
                 default:
-                    refusal = self.refuse("The last attempt is still stopping. Tap Connect again in a moment.")
+                    refusal = self.refuse("The last attempt is still stopping. Try again in a moment.")
                     return
                 }
                 // From here an error is this login's; one from the attempt it replaced may
@@ -219,11 +221,14 @@ final class VPNController: ObservableObject {
         return await connect()
     }
 
-    func savePassword(_ password: String) {
-        guard !password.isEmpty else { return }
+    /// False if it couldn't be saved.
+    @discardableResult
+    func savePassword(_ password: String) -> Bool {
+        guard !password.isEmpty else { return false }
         let saved = SharedKeychain.save(password)
         hasPassword = saved || SharedKeychain.hasPassword // a failed write keeps the old one
         lastError = saved ? nil : "Couldn't save the password to the Keychain."
+        return saved
     }
 
     func addAutoNetwork(_ ssid: String) {
