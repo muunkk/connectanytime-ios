@@ -166,7 +166,7 @@ struct ContentView: View {
     private var statusText: String {
         switch vpn.status {
         case .connected: "Connected"
-        case .connecting: "Connecting… approve Duo on your phone"
+        case .connecting: vpn.isRejoining ? "Reconnecting…" : "Connecting… approve Duo on your phone"
         case .reasserting: "Reconnecting…"
         case .disconnecting: "Disconnecting…"
         default: "Not connected"

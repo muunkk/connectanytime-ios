@@ -36,7 +36,7 @@ index b071174..e5379ce 100644
 +		cookie = buf->data;
 +		buf->data = NULL;
 +	} else if (buf->data) {
-+		memset(buf->data, 0, buf->buf_len);
++		clear_mem(buf->data, buf->buf_len);
 +	}
 +	buf_free(buf);
 +	return cookie;
@@ -55,7 +55,7 @@ index b071174..e5379ce 100644
 +	if (!cookie)
 +		return (vpninfo->strap_key && vpninfo->cookie &&
 +			!strncmp(vpninfo->cookie, "openconnect_strapkey=", 21)) ? -ENOMEM : 0;
-+	memset(vpninfo->cookie, 0, strlen(vpninfo->cookie));
++	clear_mem(vpninfo->cookie, strlen(vpninfo->cookie));
 +	free(vpninfo->cookie);
 +	vpninfo->cookie = cookie;
 +	vpn_progress(vpninfo, PRG_DEBUG, _("Refreshed STRAP key in session cookie\n"));

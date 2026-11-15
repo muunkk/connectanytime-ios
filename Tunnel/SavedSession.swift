@@ -111,6 +111,7 @@ final class SessionStore {
     func clear() {
         lock.withLock {
             written = nil
+            failing = false // the next session's first failure is logged
             delete()
         }
     }

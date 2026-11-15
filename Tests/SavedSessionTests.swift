@@ -229,6 +229,16 @@ final class SessionStoreTests: XCTestCase {
         XCTAssertEqual(store.save { self.session("C") }, .failed(first: true), "a new run of failures is reported again")
     }
 
+    /// Clearing a session that was failing to save: the next session's first failure is
+    /// reported too.
+    func testFailureAfterClearIsReported() {
+        let item = Item(), store = store(item)
+        item.failWrites = true
+        XCTAssertEqual(store.save { self.session("A") }, .failed(first: true))
+        store.clear()
+        XCTAssertEqual(store.save { self.session("B") }, .failed(first: true))
+    }
+
     // MARK: Disconnect
 
     func testLogOutDeletesTheSession() {

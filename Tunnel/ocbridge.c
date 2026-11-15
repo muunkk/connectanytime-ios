@@ -375,15 +375,21 @@ static void snapshot_saved(ocb_session *s) {
     static const char strap[] = "openconnect_strapkey=";
     bool copied = candidate || !cookie || strncmp(cookie, strap, sizeof(strap) - 1);
     if (candidate && (!cookie || !strcmp(candidate, cookie))) { wipe_free(candidate); candidate = NULL; }
+    // Until they're settled (a login's first CONNECT), where OpenConnect is now.
+    const char *dnsname = s->made_name ? s->made_name : openconnect_get_dnsname(s->vpn);
+    const char *ip = s->made_ip ? s->made_ip : openconnect_get_hostname(s->vpn);
     ocb_saved next = {
         .url = dup_or_null(s->connect_url),
         .cookie = dup_or_null(cookie),
-        // Until they're settled (a login's first CONNECT), where OpenConnect is now.
-        .dnsname = dup_or_null(s->made_name ? s->made_name : openconnect_get_dnsname(s->vpn)),
-        .ip = dup_or_null(s->made_ip ? s->made_ip : openconnect_get_hostname(s->vpn)),
+        .dnsname = dup_or_null(dnsname),
+        .ip = dup_or_null(ip),
         .candidate = candidate,
     };
-    copied = copied && (next.url || !s->connect_url) && (next.cookie || !cookie || !*cookie);
+    // dup_or_null gives NULL for an empty string too. The address pin counts: without
+    // it, a rejoin can go to another gateway.
+    copied = copied && (next.url || !s->connect_url || !*s->connect_url)
+        && (next.cookie || !cookie || !*cookie)
+        && (next.dnsname || !dnsname || !*dnsname) && (next.ip || !ip || !*ip);
     pthread_mutex_lock(&s->saved_lock);
     // A snapshot missing what couldn't be copied would replace one that can rejoin:
     // keep that one, unless there's none yet.
