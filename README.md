@@ -87,8 +87,10 @@ only if iOS also ends the extension before the next save succeeds.
 
 ## Versioning insider builds
 
-The current insider build is **0.1.2 (build 3)**, from the `overnight-diagnostics`
-branch: 0.1.1 (2) plus logging to find why the VPN can be off in the morning (the
+The current insider build is **0.1.3 (build 4)**, from the `overnight-diagnostics`
+branch: 0.1.2 (3) plus the audit fixes (PR #15) and the STRAP key kept in the saved
+session, so a rejoin after a phone restart doesn't need Duo (PR #16). 0.1.2 (3) is
+0.1.1 (2) plus logging to find why the VPN can be off in the morning (the
 server's session limits, long sleeps, and a run of refused automatic starts counted
 instead of filling the log), and a notification when the session has ended. 0.1.1
 (build 2) contains the hotspot and reconnect fixes merged in PR #13.
@@ -97,7 +99,7 @@ Each tunnel start also records the extension's version, so older log entries rem
 distinguishable after an update.
 
 For every distributed fix, increment the patch version and build number in
-`project.yml` (next: `0.1.3`, build `4`), then run `xcodegen generate` before building.
+`project.yml` (next: `0.1.4`, build `5`), then run `xcodegen generate` before building.
 Use an immutable matching Git tag, such as `v0.1.1`, and name the insider release
 `0.1.1 (2) — Hotspot and reconnect fixes`. Never replace an existing tag or distribute
 different code under an already used version/build pair. All three targets inherit
