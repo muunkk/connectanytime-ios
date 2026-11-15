@@ -67,7 +67,8 @@ enum RefusedStarts {
     /// A start is going ahead: say how many were refused before it, if any.
     static func end(log: (String) -> Void) {
         guard let (count, since, last) = finish(at: Date(), in: .standard) else { return }
-        log("\(count) automatic start\(count == 1 ? " was" : "s were") refused from \(time(since)) to \(time(last)), with no session to rejoin")
+        let when = count == 1 ? "at \(time(since))" : "from \(time(since)) to \(time(last))"
+        log("\(count) automatic start\(count == 1 ? " was" : "s were") refused \(when), with no session to rejoin")
     }
 
     static func clearNotification() {
