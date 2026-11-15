@@ -173,11 +173,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
             // Settings from builds that paused auto-connect after failed logins.
             UserDefaults.standard.removeObject(forKey: "autoPausedUntil")
             UserDefaults.standard.removeObject(forKey: "autoFailures")
-            self.saveSession(s, rejoined: rejoined)
-            // Stopped just as the login finished: don't bring the tunnel up, and don't keep
-            // a session you just disconnected.
+            self.saveSession(s, previous: rejoined)
+            // Stopped just as the login finished: don't bring the tunnel up. (saveSession
+            // doesn't keep a session you just disconnected.)
             if self.stopping {
-                if self.sessionLock.withLock({ self._logOutOnStop }) { SessionStore.clear() }
                 self.finishSession()
                 return done(self.failure("Cancelled."))
             }
@@ -299,22 +298,55 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         SessionStore.load().flatMap { $0.server == server && $0.user == user ? $0 : nil }
     }
 
-    /// Keeps what rejoining `s` takes. A rejoin keeps the login's address: on an
-    /// IPv6-only network it would read as a translated one.
-    private func saveSession(_ s: OpaquePointer, rejoined: SavedSession?) {
-        guard let url = ocb_session_url(s), let cookie = ocb_session_cookie(s) else { return }
+    /// Keeps what rejoining `s` takes, as of its login, rejoin or latest reconnect. Each
+    /// of those leaves the server holding a new key for the session (see SavedSession),
+    /// so this follows every one of them, and the end of a run: iOS can end the extension
+    /// without warning, and the next start can only rejoin with what was saved.
+    /// `previous` is the session as saved before, whose address is kept: a later one,
+    /// from an IPv6-only network, would read as a translated one.
+    /// Never undoes a Disconnect's logout. Checked again after saving, for one that came
+    /// meanwhile: either stopTunnel clears the session after this, or this does.
+    /// Call on `queue`.
+    private func saveSession(_ s: OpaquePointer, previous: SavedSession?) {
+        let loggedOut = { self.sessionLock.withLock { self._stopping && self._logOutOnStop } }
+        guard !loggedOut() else { return SessionStore.clear() }
+        var now = ocb_saved()
+        guard ocb_session_saved(s, &now) == 0 else { return }
+        defer { ocb_saved_free(&now) } // wipes its copies of the cookies
+        func str(_ p: UnsafeMutablePointer<CChar>?) -> String? { p.map { String(cString: $0) } }
         SessionStore.save(.init(server: server, user: user,
-                                url: String(cString: url), cookie: String(cString: cookie),
-                                dnsName: rejoined?.dnsName ?? ocb_session_dnsname(s).map { String(cString: $0) },
-                                ip: rejoined?.ip ?? ocb_session_ip(s).map { String(cString: $0) }))
+                                url: String(cString: now.url), cookie: String(cString: now.cookie),
+                                dnsName: previous?.dnsName ?? str(now.dnsname),
+                                ip: previous?.ip ?? str(now.ip),
+                                candidate: str(now.candidate)))
+        if loggedOut() { SessionStore.clear() }
     }
 
     /// Rejoins `saved` on a new OpenConnect session, which becomes the current one.
     /// Returns it, or nil with ocb_resume's result (OCB_SESSION_ENDED if the server no
-    /// longer has the session). A connect or TLS handshake has no timeout of its own,
-    /// so an attempt that hangs is aborted after 30 s. Blocks; call on `queue`.
+    /// longer has the session). If the server refuses the saved cookie and a reconnect
+    /// left a candidate (see SavedSession), that's tried too, once, before the session
+    /// counts as ended. Blocks; call on `queue`.
     private func resume(_ saved: SavedSession, err: inout [CChar]) -> (OpaquePointer?, Int32) {
-        guard let s = newSession(server: server, user: user, password: "") else { return (nil, -1) }
+        var failed = false // the last attempt's ocb_resume failed, and `err` says why
+        let (s, result) = saved.rejoin(refused: { $0.1 == OCB_SESSION_ENDED }) { cookie, isCandidate in
+            // The last reconnect sent the server a newer key and never heard back: the
+            // server may hold that one. One more request; no password, no Duo.
+            if isCandidate { log("The saved session key was refused; trying the newer one") }
+            let attempt = resumeOnce(saved, cookie: cookie, err: &err)
+            failed = attempt.failed
+            return (attempt.session, attempt.result)
+        }
+        if failed { log("Couldn't rejoin the session: \(String(cString: err))") }
+        return (s, result)
+    }
+
+    /// One attempt at rejoining `saved`, presenting `cookie`. `failed`: ocb_resume ran
+    /// and failed, leaving its reason in `err`. A connect or TLS handshake has no timeout
+    /// of its own, so an attempt that hangs is aborted after 30 s.
+    private func resumeOnce(_ saved: SavedSession, cookie: String,
+                            err: inout [CChar]) -> (session: OpaquePointer?, result: Int32, failed: Bool) {
+        guard let s = newSession(server: server, user: user, password: "") else { return (nil, -1, false) }
         let token = UUID()
         sessionLock.withLock { _resumeToken = token }
         // After 30 s, and every second after that until ocb_resume returns: one abort may
@@ -335,12 +367,11 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         timer.resume()
         defer { timer.cancel() }
-        let result = ocb_resume(s, saved.url, saved.cookie, saved.dnsName, saved.ip, &err, err.count)
+        let result = ocb_resume(s, saved.url, cookie, saved.dnsName, saved.ip, &err, err.count)
         sessionLock.withLock { _resumeToken = nil }
-        if result == 0 { return (s, 0) }
-        log("Couldn't rejoin the session: \(String(cString: err))")
+        if result == 0 { return (s, 0, false) }
         freeSession()
-        return (nil, result)
+        return (nil, result, true)
     }
 
     /// Logs in on `s` (ocb_connect). Reaching the server has no timeout of its own, and a
@@ -501,6 +532,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard session == s else { return }
         let reason = endReason
         endReason = nil
+        // However it ended: its last reconnect may have reached the server, which then
+        // holds a newer key than the saved one, or sent one and heard nothing back. (If
+        // the server ended the session, the rejoin below is refused and clears it.)
+        saveSession(s, previous: savedSession())
         freeSession()
         if stopping { return finishSession() }
         if givingUp { return giveUp() }
@@ -537,13 +572,10 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
         var err = [CChar](repeating: 0, count: 512)
         let (s, result) = resume(saved, err: &err)
-        // Saved before checking for a stop, so a Disconnect meanwhile can't have its
-        // logout undone: either it clears the session after this, or we do below.
-        if let s { saveSession(s, rejoined: saved) }
-        if stopping {
-            if sessionLock.withLock({ _logOutOnStop }) { SessionStore.clear() }
-            return finishSession()
-        }
+        // The server may have taken the candidate rather than the cookie. (A Disconnect
+        // meanwhile can't have its logout undone: see saveSession.)
+        if let s { saveSession(s, previous: saved) }
+        if stopping { return finishSession() }
         guard let s else {
             if result == OCB_SESSION_ENDED {
                 SessionStore.clear()
@@ -556,7 +588,7 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         let config = ocb_get_config(s, &cfg) == 0
             ? cfg.key.map { (key: String(cString: $0), settings: Self.networkSettings(cfg, server: server)) } : nil
         ocb_config_free(&cfg)
-        reconnected(config) // as after OpenConnect's own reconnects: apply any new settings
+        reconnected(config, rejoined: true) // as after OpenConnect's own reconnects: apply any new settings
         run(s)
     }
 
@@ -633,8 +665,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
     /// typically a new address because it hadn't yet noticed the old connection drop.
     /// The session is still valid, so apply them instead of ending it. Reconnecting
     /// is over once the tunnel has the newest settings.
-    private func reconnected(_ config: (key: String, settings: NEPacketTunnelNetworkSettings)?) {
-        guard session != nil else { return }
+    /// `rejoined`: it's back on a new OpenConnect session, which rejoin has just saved.
+    private func reconnected(_ config: (key: String, settings: NEPacketTunnelNetworkSettings)?,
+                             rejoined: Bool = false) {
+        guard let s = session else { return }
+        // First of all, and every time: the reconnect gave the server a new key for the
+        // session, so the saved one no longer rejoins it, and iOS can end the extension
+        // at any moment.
+        if !rejoined { saveSession(s, previous: savedSession()) }
         lastReconnectKick = Date() // it's up: don't let the watchdog drop it while settings apply
         if let config {
             wanted = WantedSettings(key: config.key, settings: config.settings, epoch: reconnectEpoch)
@@ -727,22 +765,14 @@ final class PacketTunnelProvider: NEPacketTunnelProvider {
         end("Couldn't reach the VPN server for \(Int(Self.giveUpAfter / 60)) minutes. Tap Connect to try again.")
     }
 
-    /// What rejoining the last session takes: the server's address after any redirects,
-    /// and its session cookie. In the Keychain, on this device only, since the cookie
-    /// works like a password until the session ends. Cleared on logout and once the
-    /// server ends the session.
-    private struct SavedSession: Codable {
-        let server, user, url, cookie: String
-        let dnsName, ip: String? // the server's name and the address the session is on
-    }
-
+    /// The saved session (see SavedSession), in the Keychain.
     private enum SessionStore {
         static func load() -> SavedSession? {
-            KeychainItem.read(SavedSessionItem.account).flatMap { try? JSONDecoder().decode(SavedSession.self, from: Data($0.utf8)) }
+            KeychainItem.read(SavedSessionItem.account).flatMap(SavedSession.init(json:))
         }
         static func save(_ session: SavedSession) {
-            guard let data = try? JSONEncoder().encode(session) else { return }
-            KeychainItem.save(String(decoding: data, as: UTF8.self), as: SavedSessionItem.account)
+            guard let json = session.json else { return }
+            KeychainItem.save(json, as: SavedSessionItem.account)
         }
         static func clear() { KeychainItem.delete(SavedSessionItem.account) }
     }

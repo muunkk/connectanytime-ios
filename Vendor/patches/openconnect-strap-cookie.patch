@@ -1,0 +1,141 @@
+diff --git a/cstp.c b/cstp.c
+index b071174..fdf6c50 100644
+--- a/cstp.c
++++ b/cstp.c
+@@ -223,6 +223,64 @@ static void append_connect_strap_headers(struct openconnect_info *vpninfo,
+ }
+ #endif
+ 
++/* The session cookie with the STRAP key OpenConnect holds now, or NULL. Every CONNECT on
++ * a live session rekeys: it signs with the old key and hands the server a new one. The
++ * cookie still carries the key from login, so a client that saves it can't resume the
++ * session in a new process. The caller frees (and should wipe) the result. */
++static char *strap_cookie(struct openconnect_info *vpninfo)
++{
++#ifdef HAVE_HPKE_SUPPORT
++	static const char prefix[] = "openconnect_strapkey=";
++	struct oc_text_buf *buf;
++	const char *rest;
++	char *cookie = NULL;
++
++	if (vpninfo->no_external_auth || !vpninfo->strap_key || !vpninfo->cookie ||
++	    strncmp(vpninfo->cookie, prefix, sizeof(prefix) - 1) ||
++	    !(rest = strchr(vpninfo->cookie, ';')))
++		return NULL;
++
++	buf = buf_alloc();
++	if (!buf)
++		return NULL;
++	buf_append(buf, "%s", prefix);
++	append_strap_privkey(vpninfo, buf);
++	buf_append(buf, "%s", rest);
++	if (!buf_error(buf) && buf->pos > (int)(sizeof(prefix) - 1 + strlen(rest))) {
++		cookie = buf->data;
++		buf->data = NULL;
++	} else if (buf->data) {
++		memset(buf->data, 0, buf->buf_len);
++	}
++	buf_free(buf);
++	return cookie;
++#else
++	(void)vpninfo;
++	return NULL;
++#endif
++}
++
++/* The server accepted the key this CONNECT presented: put it in the cookie. */
++static void refresh_strap_cookie(struct openconnect_info *vpninfo)
++{
++	char *cookie = strap_cookie(vpninfo);
++
++	if (!cookie)
++		return;
++	memset(vpninfo->cookie, 0, strlen(vpninfo->cookie));
++	free(vpninfo->cookie);
++	vpninfo->cookie = cookie;
++	vpn_progress(vpninfo, PRG_DEBUG, _("Refreshed STRAP key in session cookie\n"));
++}
++
++/* The cookie with the key OpenConnect would present next. It differs from
++ * openconnect_get_cookie() after a CONNECT that sent a new key but got no 200: the
++ * server holds one of the two. Until a 200, every CONNECT presents this same key. */
++char *openconnect_strap_candidate_cookie(struct openconnect_info *vpninfo)
++{
++	return strap_cookie(vpninfo);
++}
++
+ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rekey)
+ {
+ 	struct oc_text_buf *reqbuf;
+@@ -255,8 +313,16 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
+ 		2004, "Cisco Systems, Inc.");
+ 
+ #ifdef HAVE_HPKE_SUPPORT
+-	if (!vpninfo->no_external_auth && vpninfo->strap_pubkey)
+-		append_connect_strap_headers(vpninfo, reqbuf, strap_rekey);
++	if (!vpninfo->no_external_auth && vpninfo->strap_pubkey) {
++		/* After an unanswered rekey, present that key again rather than a newer one,
++		 * so the server holds either it or the accepted key in the cookie, never a
++		 * third key the client has already forgotten. (The cookie keeps the accepted
++		 * key; openconnect_strap_candidate_cookie() gives this one.) */
++		int rekey = strap_rekey && !vpninfo->strap_unresolved;
++		append_connect_strap_headers(vpninfo, reqbuf, rekey);
++		if (rekey)
++			vpninfo->strap_unresolved = 1;
++	}
+ #endif
+ 
+ 	append_mobile_headers(vpninfo, reqbuf);
+@@ -382,6 +448,10 @@ static int start_cstp_connection(struct openconnect_info *vpninfo, int strap_rek
+ 	}
+ 
+ 	vpn_progress(vpninfo, PRG_INFO, _("Got CONNECT response: %s\n"), buf);
++	/* The server took the STRAP key with its 200, even if the rest of this response
++	 * fails: record it now. */
++	vpninfo->strap_unresolved = 0;
++	refresh_strap_cookie(vpninfo);
+ 
+ 	/* We may have advertised it, but we only do it if the server agrees */
+ 	vpninfo->cstp_compr = vpninfo->dtls_compr = 0;
+diff --git a/openconnect-internal.h b/openconnect-internal.h
+index 7a836e9..7c82e8c 100644
+--- a/openconnect-internal.h
++++ b/openconnect-internal.h
+@@ -617,6 +617,9 @@ struct openconnect_info {
+ #endif /* OPENCONNECT_GNUTLS */
+ 	char *strap_pubkey;
+ 	char *strap_dh_pubkey;
++	/* A CONNECT presented a new STRAP key and no 200 has come back: the server holds
++	 * either it or the previous one. Don't rekey again until a 200 settles it. */
++	int strap_unresolved;
+ 	char *ciphersuite_config;
+ 	struct oc_text_buf *ttls_pushbuf;
+ 	uint8_t ttls_eap_ident;
+diff --git a/openconnect.h b/openconnect.h
+index 136f181..060cc8d 100644
+--- a/openconnect.h
++++ b/openconnect.h
+@@ -667,6 +667,9 @@ int openconnect_get_ip_info(struct openconnect_info *,
+ 
+ int openconnect_get_port(struct openconnect_info *);
+ const char *openconnect_get_cookie(struct openconnect_info *);
++/* Patched in (openconnect-strap-cookie.patch): the cookie with the STRAP key that the
++ * next CONNECT would present, or NULL. Free (and wipe) it. */
++char *openconnect_strap_candidate_cookie(struct openconnect_info *);
+ int openconnect_set_cookie(struct openconnect_info *, const char *);
+ void openconnect_clear_cookie(struct openconnect_info *);
+ 
+diff --git a/openssl.c b/openssl.c
+index 761cb03..c26b8f3 100644
+--- a/openssl.c
++++ b/openssl.c
+@@ -2440,6 +2440,9 @@ void append_strap_privkey(struct openconnect_info *vpninfo,
+ 	int derlen = i2d_ECPrivateKey(vpninfo->strap_key, &der);
+ 	if (derlen > 0)
+ 		buf_append_base64(buf, der, derlen, 0);
++	/* A private key: wipe it, and don't leak it on every reconnect. */
++	if (der)
++		OPENSSL_clear_free(der, derlen > 0 ? derlen : 0);
+ }
+ 
+ #include <openssl/kdf.h>

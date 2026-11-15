@@ -120,6 +120,7 @@ targets:
       - Tests
       - Tunnel/SplitRoute.swift
       - Tunnel/RefusedStarts.swift
+      - Tunnel/SavedSession.swift
       - Shared/Shared.swift
     settings:
       base:

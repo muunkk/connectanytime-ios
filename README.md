@@ -46,6 +46,17 @@ AnyConnect protocol. It logs in to `vpn.shanghai.nyu.edu` with your NetID, passw
 `push` (Duo). It checks the server's certificate against iOS's trust store, then routes
 traffic through the tunnel.
 
+To come back without Duo after iOS stops or restarts the VPN extension, the extension
+saves the session and rejoins it. The session's cookie carries a key (OpenConnect's
+STRAP key), and every reconnect hands the server a new one. OpenConnect 9.21 leaves the
+cookie as it was at login, so a session saved then carries a key the server no longer
+holds (ConnectAnytime for Android, which shares this code, got 401 for every such
+rejoin). `Vendor/patches/openconnect-strap-cookie.patch` puts the key the server
+accepted back into the cookie, and the extension saves the session again after every
+reconnect. If a reconnect sent a new key and never heard back, the server holds one of
+two keys: both are saved, and a rejoin tries the newer one only if the other is
+refused. That's one more request at most, never a password or a Duo push.
+
 ## Your password
 
 - Stored in the iPhone Keychain, shared only between the app and its VPN extension.

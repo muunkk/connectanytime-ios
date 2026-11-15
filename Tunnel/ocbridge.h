@@ -42,7 +42,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
 int ocb_connect(ocb_session *s, char *err, size_t errlen);
 
 /// Rejoins the session from an earlier login instead of logging in: no password,
-/// no Duo. The arguments come from the ocb_session_* getters below; `dnsname` and
+/// no Duo. The arguments come from ocb_session_saved below; `dnsname` and
 /// `ip` (may be NULL) pin the server's name to the address the session was made
 /// on. 0 on success, OCB_SESSION_ENDED if the server no longer accepts the session,
 /// any other negative value on other failures (e.g. no network).
@@ -50,12 +50,23 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen);
 int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *dnsname,
                const char *ip, char *err, size_t errlen);
 
-/// After ocb_connect or ocb_resume succeeds: what ocb_resume needs to rejoin the
-/// session later. Owned by the session. The cookie is a credential; never log it.
-const char *ocb_session_url(ocb_session *s);
-const char *ocb_session_cookie(ocb_session *s);
-const char *ocb_session_dnsname(ocb_session *s);
-const char *ocb_session_ip(ocb_session *s);
+/// What ocb_resume needs to rejoin the session later. Strings are owned by the struct.
+/// `cookie` carries the STRAP key the server last accepted: every reconnect hands the
+/// server a new key, which openconnect-strap-cookie.patch puts into the cookie.
+/// `candidate` carries a newer key that a reconnect presented without an answer: the
+/// server may hold it, so try it only if `cookie` gets OCB_SESSION_ENDED. Both are
+/// credentials; never log them.
+typedef struct {
+    char *url, *cookie;
+    char *dnsname, *ip;       // the server's name and the address connected to; may be NULL
+    char *candidate;          // NULL if none
+} ocb_saved;
+
+/// The session as of the last ocb_connect, ocb_resume or reconnect, or the end of
+/// ocb_run. Thread-safe: `out` gets copies, since a reconnect in ocb_run replaces the
+/// cookie. 0 on success; then free them with ocb_saved_free.
+int ocb_session_saved(ocb_session *s, ocb_saved *out);
+void ocb_saved_free(ocb_saved *saved);
 
 int ocb_get_config(ocb_session *s, ocb_config *out);
 void ocb_config_free(ocb_config *c);
