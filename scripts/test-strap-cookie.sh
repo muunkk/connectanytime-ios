@@ -1,9 +1,13 @@
 #!/bin/bash
-# Tests openconnect-strap-cookie.patch on this Mac: OpenConnect hands the server a new key
-# for the session (STRAP) on every reconnect, and the saved cookie has to carry it.
-# Builds OpenConnect with Vendor/patches and runs Vendor/tests/strap-cookie-test.c against
-# it. Then the negative control: the same test against OpenConnect without that patch,
-# where it has to fail, since a test that passes either way proves nothing.
+# Tests, on this Mac, that a saved session can be rejoined: OpenConnect hands the server a
+# new key for the session (STRAP) on every reconnect, and the saved cookie has to carry it.
+# Builds OpenConnect with Vendor/patches and runs against it:
+#   Vendor/tests/strap-cookie-test.c     openconnect-strap-cookie.patch itself
+#   Vendor/tests/bridge-session-test.c   Tunnel/ocbridge.c's saved session, end to end
+#                                        against a server that enforces the key; then
+#                                        again under ThreadSanitizer
+# Then the negative control: both against OpenConnect without that patch, where they have
+# to fail, since a test that passes either way proves nothing.
 # Needs Homebrew's openssl@3 (3.5, as the iOS build uses), the Command Line Tools, and
 # the OpenConnect tarball that Vendor/build-deps.sh downloads. Builds in
 # Vendor/src/build-host, which Git ignores.
@@ -51,6 +55,17 @@ cookie_test() {
   "$out"
 }
 
+# bridge_test <name> [compiler flag]...: bridge-session-test.c, which compiles the real
+# Tunnel/ocbridge.c, against that build.
+bridge_test() {
+  local oc="$HOST/$1/openconnect-9.21" out="$HOST/$1/bridge-session-test"
+  shift
+  /usr/bin/clang -g -Wall -Wno-unused-function -Wno-deprecated-declarations "$@" -I../Tunnel -I"$oc" -I"$OSSL/include" \
+    tests/bridge-session-test.c "$oc/.libs/libopenconnect.a" -L"$OSSL/lib" -lssl -lcrypto -lxml2 -lz -liconv \
+    -framework Security -framework CoreFoundation -o "$out"
+  "$out"
+}
+
 # must_fail <test> <name> [flag]...: 1 is a test's own "checks failed"; anything else is a
 # crash or a broken build.
 must_fail() {
@@ -68,9 +83,19 @@ build patched "${ALL[@]}"
 cookie_test patched
 
 echo
+echo "== The bridge's saved session (bridge-session-test.c), on the same build"
+bridge_test patched
+
+echo
+echo "== The same under ThreadSanitizer (the snapshot is read while OpenConnect reconnects)"
+bridge_test patched -fsanitize=thread | tail -n 1
+
+echo
 echo "== Negative control: without openconnect-strap-cookie.patch, checks have to fail"
 build unpatched "${OTHERS[@]}"
 must_fail cookie_test unpatched -DWITHOUT_STRAP_PATCH
+echo
+must_fail bridge_test unpatched -DWITHOUT_STRAP_PATCH
 
 echo
-echo "OK: passes with the patch, fails without it"
+echo "OK: both pass with the patch and fail without it"

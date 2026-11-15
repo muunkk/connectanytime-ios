@@ -134,9 +134,10 @@ scripts/test-strap-cookie.sh
 
 This one runs on the Mac, after `Vendor/build-deps.sh` (it uses the OpenConnect
 download) and with Homebrew's `openssl@3`. It builds the patched OpenConnect for the Mac
-and runs `Vendor/tests/strap-cookie-test.c`, which tests the patch above: which key the
-session cookie carries after each kind of reconnect. It then has to fail against
-OpenConnect without the patch.
+and checks that a saved session can be rejoined: `Vendor/tests/strap-cookie-test.c` tests
+the patch above, and `Vendor/tests/bridge-session-test.c` runs the extension's own
+`Tunnel/ocbridge.c` against a local server that refuses any key but the session's
+current one. Both then have to fail against OpenConnect without the patch.
 
 A VPN can't run in the Simulator, but the whole app builds for it once the libraries
 exist for it too (Apple silicon Macs only):
