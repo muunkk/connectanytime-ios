@@ -42,7 +42,7 @@ ocb_session *ocb_new(const char *server, const char *user, const char *password,
 int ocb_connect(ocb_session *s, char *err, size_t errlen);
 
 /// Rejoins the session from an earlier login instead of logging in: no password,
-/// no Duo. The arguments come from the ocb_session_* getters below; `dnsname` and
+/// no Duo. The arguments come from ocb_session_saved below; `dnsname` and
 /// `ip` (may be NULL) pin the server's name to the address the session was made
 /// on. 0 on success, OCB_SESSION_ENDED if the server no longer accepts the session,
 /// any other negative value on other failures (e.g. no network).
@@ -50,12 +50,35 @@ int ocb_connect(ocb_session *s, char *err, size_t errlen);
 int ocb_resume(ocb_session *s, const char *url, const char *cookie, const char *dnsname,
                const char *ip, char *err, size_t errlen);
 
-/// After ocb_connect or ocb_resume succeeds: what ocb_resume needs to rejoin the
-/// session later. Owned by the session. The cookie is a credential; never log it.
-const char *ocb_session_url(ocb_session *s);
-const char *ocb_session_cookie(ocb_session *s);
-const char *ocb_session_dnsname(ocb_session *s);
-const char *ocb_session_ip(ocb_session *s);
+/// What ocb_resume needs to rejoin the session later. Strings are owned by the struct.
+/// `cookie` carries the STRAP key the server last accepted: every reconnect hands the
+/// server a new key, which openconnect-strap-cookie.patch puts into the cookie.
+/// `candidate` carries a newer key that a reconnect presented without an answer: the
+/// server may hold it, so try it only if `cookie` gets OCB_SESSION_ENDED. Both are
+/// credentials; never log them.
+typedef struct {
+    char *url, *cookie;
+    char *dnsname, *ip;       // the server's name and the address connected to; may be NULL
+    char *candidate;          // NULL if none
+} ocb_saved;
+
+/// The session as it stands: as of the last ocb_connect or ocb_resume, and in ocb_run
+/// as of the last request that presented a new key or got the server's 200.
+/// Thread-safe: `out` gets copies, since a reconnect in ocb_run replaces the cookie.
+/// `dnsname` and `ip` stay those the session was made on, whatever address a reconnect
+/// reached. 0 on success; then free them with ocb_saved_free.
+int ocb_session_saved(ocb_session *s, ocb_saved *out);
+void ocb_saved_free(ocb_saved *saved);
+
+/// Called in ocb_run, on its thread, each time what ocb_session_saved returns changes:
+/// just before a reconnect's request hands the server a new key (now the `candidate`),
+/// and when the server answers 200 (the key it took is now in `cookie`). The request
+/// isn't sent until this returns, so a handler that saves the session has the new key
+/// stored before the server can hold it: iOS can end the extension at any moment, such
+/// as while that request waits for its answer. It must not wait for anything that waits
+/// for ocb_run. Set it before ocb_run.
+typedef void (*ocb_save_fn)(void *ctx, ocb_session *s);
+void ocb_set_save_handler(ocb_session *s, ocb_save_fn save);
 
 int ocb_get_config(ocb_session *s, ocb_config *out);
 void ocb_config_free(ocb_config *c);

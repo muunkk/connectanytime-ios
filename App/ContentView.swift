@@ -166,7 +166,8 @@ struct ContentView: View {
     private var statusText: String {
         switch vpn.status {
         case .connected: "Connected"
-        case .connecting: "Connecting… approve Duo on your phone"
+        // A rejoin from the saved session asks for no Duo, and the app can't tell which this is.
+        case .connecting: "Connecting… approve Duo if asked"
         case .reasserting: "Reconnecting…"
         case .disconnecting: "Disconnecting…"
         default: "Not connected"
