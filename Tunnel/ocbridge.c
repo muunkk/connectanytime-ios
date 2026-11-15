@@ -370,6 +370,10 @@ static void snapshot_saved(ocb_session *s) {
     const char *cookie = openconnect_get_cookie(s->vpn); // with the key the server last accepted
     // The key a CONNECT presented without an answer, if there is one: the server may hold it.
     char *candidate = openconnect_strap_candidate_cookie(s->vpn);
+    // None for a cookie with a STRAP key means it couldn't be copied (out of memory):
+    // OpenConnect holds one whenever the cookie carries one.
+    static const char strap[] = "openconnect_strapkey=";
+    bool copied = candidate || !cookie || strncmp(cookie, strap, sizeof(strap) - 1);
     if (candidate && (!cookie || !strcmp(candidate, cookie))) { wipe_free(candidate); candidate = NULL; }
     ocb_saved next = {
         .url = dup_or_null(s->connect_url),
@@ -379,9 +383,13 @@ static void snapshot_saved(ocb_session *s) {
         .ip = dup_or_null(s->made_ip ? s->made_ip : openconnect_get_hostname(s->vpn)),
         .candidate = candidate,
     };
+    copied = copied && (next.url || !s->connect_url) && (next.cookie || !cookie || !*cookie);
     pthread_mutex_lock(&s->saved_lock);
-    ocb_saved old = s->saved;
-    s->saved = next;
+    // A snapshot missing what couldn't be copied would replace one that can rejoin:
+    // keep that one, unless there's none yet.
+    bool keep = !copied && s->saved.cookie;
+    ocb_saved old = keep ? next : s->saved;
+    if (!keep) s->saved = next;
     pthread_mutex_unlock(&s->saved_lock);
     ocb_saved_free(&old);
 }

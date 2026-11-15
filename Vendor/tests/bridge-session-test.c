@@ -34,6 +34,16 @@ static void openconnect_set_session_changed_handler(struct openconnect_info *vpn
 {
 	(void)vpninfo; (void)handler;
 }
+#else
+/* The next copy of the candidate cookie fails, as when out of memory. */
+#include <openconnect.h>
+static int fail_candidate;
+static char *candidate_or_fail(struct openconnect_info *vpninfo)
+{
+	if (fail_candidate) { fail_candidate = 0; return NULL; }
+	return openconnect_strap_candidate_cookie(vpninfo);
+}
+#define openconnect_strap_candidate_cookie candidate_or_fail
 #endif
 #include "ocbridge.c"
 
@@ -663,6 +673,12 @@ int main(int argc, char **argv)
 	ocb_reconnect(s);
 	CHECK(wait_past(&sleeps, slept), "the attempt failed");
 	end_run(run);
+#ifndef WITHOUT_STRAP_PATCH
+	/* A snapshot that can't copy the candidate keeps the one before, which can rejoin. */
+	fail_candidate = 1;
+	snapshot_saved(s); /* safe here: nothing runs OpenConnect any more */
+	CHECK(!fail_candidate, "(a snapshot whose candidate couldn't be copied)");
+#endif
 	take_saved(s, &v);
 	ocb_free(s);
 	server_key(server); cookie_key(v.cookie, key);
