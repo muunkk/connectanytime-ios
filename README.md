@@ -52,10 +52,20 @@ STRAP key), and every reconnect hands the server a new one. OpenConnect 9.21 lea
 cookie as it was at login, so a session saved then carries a key the server no longer
 holds (ConnectAnytime for Android, which shares this code, got 401 for every such
 rejoin). `Vendor/patches/openconnect-strap-cookie.patch` puts the key the server
-accepted back into the cookie, and the extension saves the session again after every
-reconnect. If a reconnect sent a new key and never heard back, the server holds one of
-two keys: both are saved, and a rejoin tries the newer one only if the other is
-refused. That's one more request at most, never a password or a Duo push.
+accepted back into the cookie, and the extension saves the session again in every
+reconnect, twice: just before the request that carries the new key goes out, and when
+the server answers it. iOS can end the extension at any moment, including while that
+request waits for its answer, and what's in the Keychain then is all the next start has.
+Between those two moments the server holds one of two keys: both are saved, and a rejoin
+tries the newer one only if the other is refused. That's one more request at most, never
+a password or a Duo push. Until the server answers 200, every further attempt presents
+that same new key, never a third.
+
+This rests on two things about the server that can only be seen from outside. One is
+that it checks each request against the key it holds and then keeps the key presented,
+which fits the 401s above. The other is that refusing a key with 401 leaves the session
+itself open, so the other saved key can still rejoin it. If a refusal ended the session
+instead, a reconnect cut off between its two saves could still cost a new login.
 
 ## Your password
 
@@ -137,7 +147,8 @@ download) and with Homebrew's `openssl@3`. It builds the patched OpenConnect for
 and checks that a saved session can be rejoined: `Vendor/tests/strap-cookie-test.c` tests
 the patch above, and `Vendor/tests/bridge-session-test.c` runs the extension's own
 `Tunnel/ocbridge.c` against a local server that refuses any key but the session's
-current one. Both then have to fail against OpenConnect without the patch.
+current one, including a rejoin from what had been saved while a reconnect was still
+waiting for the server. Both then have to fail against OpenConnect without the patch.
 
 A VPN can't run in the Simulator, but the whole app builds for it once the libraries
 exist for it too (Apple silicon Macs only):
